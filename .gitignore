@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[oc]
+*.so
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+
+# Tests / linters
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/
+
+# Local media dropped while trying the app
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
