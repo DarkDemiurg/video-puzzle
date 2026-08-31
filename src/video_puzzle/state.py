@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from video_puzzle.encode import DEFAULT_ENCODER, DEFAULT_QUALITY, EncodeQuality, EncoderKind
 from video_puzzle.layout import (
     MAX_GRID,
     MAX_SLOTS,
@@ -8,6 +9,7 @@ from video_puzzle.layout import (
     AppMode,
     Layout,
     canvas_size,
+    even,
     slot_count,
 )
 
@@ -21,25 +23,34 @@ class Slot:
     path: Path | None = None
     duration: float | None = None
     has_audio: bool = False
+    fps: float | None = None
     trim_start: float = 0.0
     mark_in: float | None = None
     mark_out: float | None = None
+    rotation: int = 0
+    crop: tuple[float, float, float, float] | None = None
 
     def clear(self) -> None:
         self.path = None
         self.duration = None
         self.has_audio = False
+        self.fps = None
         self.trim_start = 0.0
         self.mark_in = None
         self.mark_out = None
+        self.rotation = 0
+        self.crop = None
 
     def set_path(self, path: Path) -> None:
         if self.path != path:
             self.trim_start = 0.0
             self.duration = None
             self.has_audio = False
+            self.fps = None
             self.mark_in = None
             self.mark_out = None
+            self.rotation = 0
+            self.crop = None
         self.path = path
 
     def set_marks(self, mark_in: float, mark_out: float) -> None:
@@ -80,12 +91,17 @@ class Slot:
 class AppState:
     layout: Layout = Layout.FOUR_SQUARE
     resolution: int = 1080
+    quality: EncodeQuality = DEFAULT_QUALITY
+    encoder: EncoderKind = DEFAULT_ENCODER
     mode: AppMode = AppMode.PUZZLE
     wall_rows: int = 2
     wall_cols: int = 2
     slots: list[Slot] = field(default_factory=lambda: [Slot() for _ in range(MAX_SLOTS)])
     playhead: float = 0.0
     include_audio: bool = True
+    audio_slot: int | None = None
+    normalize_audio: bool = False
+    cell_gap: int = 0
     range_enabled: bool = False
     range_start: float = 0.0
     range_end: float | None = None
@@ -95,6 +111,11 @@ class AppState:
             raise ValueError(f"Expected {MAX_SLOTS} slots, got {len(self.slots)}")
         canvas_size(self.resolution)
         self._clamp_wall()
+        self.quality = EncodeQuality(self.quality)
+        self.encoder = EncoderKind(self.encoder)
+        self.cell_gap = even(max(0, min(40, self.cell_gap)))
+        if self.audio_slot is not None and not 0 <= self.audio_slot < MAX_SLOTS:
+            self.audio_slot = None
 
     @property
     def is_wall(self) -> bool:
@@ -128,6 +149,23 @@ class AppState:
         canvas_size(height)
         self.resolution = height
 
+    def set_quality(self, quality: EncodeQuality) -> None:
+        self.quality = EncodeQuality(quality)
+
+    def set_encoder(self, encoder: EncoderKind) -> None:
+        self.encoder = EncoderKind(encoder)
+
+    def set_cell_gap(self, gap: int) -> None:
+        self.cell_gap = even(max(0, min(40, gap)))
+
+    def swap_slots(self, first: int, second: int) -> None:
+        if first == second:
+            return
+        if not 0 <= first < MAX_SLOTS or not 0 <= second < MAX_SLOTS:
+            raise IndexError("Slot index is out of range")
+        self.slots[first], self.slots[second] = self.slots[second], self.slots[first]
+        self.clamp_playhead()
+
     def set_slot(self, index: int, path: Path | None) -> None:
         if not 0 <= index < MAX_SLOTS:
             raise IndexError(f"Slot index {index} is out of range")
@@ -142,11 +180,14 @@ class AppState:
     def clear_slot(self, index: int) -> None:
         self.set_slot(index, None)
 
-    def set_probe(self, index: int, duration: float, has_audio: bool) -> None:
+    def set_probe(
+        self, index: int, duration: float, has_audio: bool, fps: float | None = None
+    ) -> None:
         if not 0 <= index < MAX_SLOTS:
             raise IndexError(f"Slot index {index} is out of range")
         self.slots[index].duration = max(0.0, duration)
         self.slots[index].has_audio = has_audio
+        self.slots[index].fps = fps if fps is not None and fps > 0 else None
         self.clamp_playhead()
 
     def assign_paths(self, paths: list[Path], start: int = 0) -> int:
@@ -310,8 +351,20 @@ class AppState:
             time = min(time, max(0.0, slot.duration - 0.04))
         return max(0.0, time)
 
+    def output_fps(self) -> float:
+        rates = [slot.fps for slot in self.active_slots() if slot.fps]
+        if not rates:
+            return 30.0
+        return max(rates)
+
     def audio_input_index(self) -> int | None:
         if not self.include_audio:
+            return None
+        if self.audio_slot is not None:
+            if 0 <= self.audio_slot < self.active_count:
+                slot = self.slots[self.audio_slot]
+                if slot.path is not None and slot.has_audio:
+                    return self.audio_slot
             return None
         for index, slot in enumerate(self.active_slots()):
             if slot.path is not None and slot.has_audio:

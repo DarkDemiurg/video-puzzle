@@ -6,9 +6,32 @@ QMainWindow, QWidget#central {
     background: #1b1d23;
     color: #e8eaed;
 }
-QWidget#sidebar {
+QWidget#sidebar, QScrollArea#sidebarScroll, QScrollArea#sidebarScroll > QWidget {
     background: #14161b;
-    border-right: 1px solid #2c3038;
+}
+QScrollArea#sidebarScroll {
+    border: none;
+}
+QSplitter#mainSplitter::handle:horizontal {
+    background: #2c3038;
+    margin: 0;
+    width: 4px;
+}
+QSplitter#mainSplitter::handle:horizontal:hover {
+    background: #3d8bfd;
+}
+QScrollBar:vertical {
+    background: #14161b;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #2a3140;
+    min-height: 24px;
+    border-radius: 4px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
 }
 QLabel#title {
     font-size: 18px;

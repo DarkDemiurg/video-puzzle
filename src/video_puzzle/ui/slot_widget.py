@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QPixmap, QResizeEvent
+from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, Signal
+from PySide6.QtGui import QDrag, QDragEnterEvent, QDropEvent, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from video_puzzle.state import is_video_file
 
 FILE_FILTER = "Видео (*.mp4 *.mov *.mkv *.webm *.avi *.m4v);;Все файлы (*)"
+SLOT_MIME = "application/x-video-puzzle-slot"
 
 
 def paths_from_urls(urls: list) -> list[Path]:
@@ -26,12 +27,15 @@ class SlotWidget(QFrame):
     file_picked = Signal(int, Path)
     cleared = Signal(int)
     trim_requested = Signal(int)
+    swap_requested = Signal(int, int)
 
     def __init__(self, index: int, parent=None) -> None:
         super().__init__(parent)
         self.index = index
         self._pixmap: QPixmap | None = None
         self._wall_mode = False
+        self._press_pos = None
+        self._dragged = False
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -177,12 +181,39 @@ class SlotWidget(QFrame):
             child = self.childAt(event.position().toPoint())
             if child in {self.clear_btn, self.mark_btn, self.badge}:
                 return
-            if self._wall_mode and self.clear_btn.isVisible():
-                self.trim_requested.emit(self.index)
-                return
-            self._pick_file()
+            self._press_pos = event.position()
+            self._dragged = False
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._press_pos is None or not self.clear_btn.isVisible():
+            return
+        if (event.position() - self._press_pos).manhattanLength() < 8:
+            return
+        self._dragged = True
+        mime = QMimeData()
+        mime.setData(SLOT_MIME, QByteArray(str(self.index).encode("utf-8")))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        if self._pixmap is not None and not self._pixmap.isNull():
+            drag.setPixmap(self._pixmap.scaled(96, 54, Qt.AspectRatioMode.KeepAspectRatio))
+        drag.exec(Qt.DropAction.MoveAction)
+        self._press_pos = None
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._press_pos is None:
+            super().mouseReleaseEvent(event)
+            return
+        dragged = self._dragged
+        self._press_pos = None
+        self._dragged = False
+        if dragged:
+            return
+        if self._wall_mode and self.clear_btn.isVisible():
+            self.trim_requested.emit(self.index)
+            return
+        self._pick_file()
 
     def _pick_file(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, "Выберите видеофайл", "", FILE_FILTER)
@@ -193,14 +224,28 @@ class SlotWidget(QFrame):
             self.file_picked.emit(self.index, path)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            paths = paths_from_urls(event.mimeData().urls())
-            if any(is_video_file(path) for path in paths):
-                event.acceptProposedAction()
-                return
+        if event.mimeData().hasFormat(SLOT_MIME) or event.mimeData().hasUrls():
+            if event.mimeData().hasUrls():
+                paths = paths_from_urls(event.mimeData().urls())
+                if not any(is_video_file(path) for path in paths):
+                    event.ignore()
+                    return
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasFormat(SLOT_MIME):
+            raw = bytes(event.mimeData().data(SLOT_MIME)).decode("utf-8")
+            try:
+                source = int(raw)
+            except ValueError:
+                event.ignore()
+                return
+            if source != self.index:
+                self.swap_requested.emit(source, self.index)
+            event.acceptProposedAction()
+            return
         paths = [path for path in paths_from_urls(event.mimeData().urls()) if is_video_file(path)]
         if paths:
             self.files_dropped.emit(self.index, paths)

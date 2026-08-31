@@ -2,24 +2,27 @@ from __future__ import annotations
 
 import re
 
-PROGRESS_TIME_RE = re.compile(
-    r"(?:out_time_ms=(\d+)|out_time_us=(\d+)|out_time=(\d+):(\d+):(\d+(?:\.\d+)?)|time=(\d+):(\d+):(\d+(?:\.\d+)?))"
-)
+
+def _int_field(raw: str) -> int | None:
+    if raw in {"N/A", "NA"}:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def parse_progress_seconds(line: str) -> float | None:
-    """Parse an ffmpeg -progress / stats line into seconds, if present."""
+    """Parse an ffmpeg -progress / stats line into output seconds, if present.
+
+    ffmpeg's ``out_time_ms`` is a deprecated alias of ``out_time_us`` (microseconds).
+    """
     stripped = line.strip()
-    if stripped.startswith("out_time_ms="):
-        value = stripped.split("=", 1)[1]
-        if value in {"N/A", "NA"}:
+    if stripped.startswith("out_time_us=") or stripped.startswith("out_time_ms="):
+        value = _int_field(stripped.split("=", 1)[1])
+        if value is None:
             return None
-        return int(value) / 1000.0
-    if stripped.startswith("out_time_us="):
-        value = stripped.split("=", 1)[1]
-        if value in {"N/A", "NA"}:
-            return None
-        return int(value) / 1_000_000.0
+        return value / 1_000_000.0
     match = re.search(r"(?:out_time|time)=(\d+):(\d+):(\d+(?:\.\d+)?)", stripped)
     if not match:
         return None

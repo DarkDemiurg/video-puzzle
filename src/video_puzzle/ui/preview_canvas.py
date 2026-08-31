@@ -28,7 +28,7 @@ class PreviewCanvas(QWidget):
         for slot in self.slots:
             slot.set_wall_mode(enabled)
 
-    def apply_layout(self, kind: Layout) -> None:
+    def apply_layout(self, kind: Layout, gap: int = 10) -> None:
         count = slot_count(kind)
         self.ensure_slots(count)
         inner = self._replace_inner()
@@ -72,17 +72,17 @@ class PreviewCanvas(QWidget):
             layout.addLayout(bottom, 1)
 
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setSpacing(max(8, gap))
         for slot in visible:
             slot.show()
 
-    def apply_grid(self, rows: int, cols: int) -> None:
+    def apply_grid(self, rows: int, cols: int, gap: int = 8) -> None:
         count = rows * cols
         self.ensure_slots(count)
         inner = self._replace_inner()
         grid = QGridLayout(inner)
         grid.setContentsMargins(12, 12, 12, 12)
-        grid.setSpacing(8)
+        grid.setSpacing(max(8, gap))
         for index in range(count):
             slot = self.slots[index]
             grid.addWidget(slot, index // cols, index % cols)

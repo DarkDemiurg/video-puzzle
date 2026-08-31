@@ -4,7 +4,7 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from video_puzzle.probe import ProbeError, parse_probe_json, probe_video
+from video_puzzle.probe import ProbeError, parse_frame_rate, parse_probe_json, probe_video
 
 
 def test_parse_probe_json_uses_format_duration_and_audio_flag() -> None:
@@ -32,6 +32,30 @@ def test_parse_probe_json_without_audio() -> None:
 def test_parse_probe_json_requires_duration() -> None:
     with pytest.raises(ProbeError):
         parse_probe_json(json.dumps({"streams": [], "format": {}}))
+
+
+def test_parse_probe_json_reads_frame_rate() -> None:
+    payload = json.dumps(
+        {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "duration": "4",
+                    "avg_frame_rate": "30000/1001",
+                    "r_frame_rate": "30/1",
+                }
+            ],
+            "format": {},
+        }
+    )
+    result = parse_probe_json(payload)
+    assert result.fps == pytest.approx(30000 / 1001)
+
+
+def test_parse_frame_rate_rejects_junk() -> None:
+    assert parse_frame_rate("0/0") is None
+    assert parse_frame_rate("25") == pytest.approx(25.0)
+    assert parse_frame_rate("999") is None
 
 
 def test_probe_video_uses_runner(tmp_path: Path) -> None:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QStandardPaths, QThread, QTimer, Signal
+from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -19,21 +23,31 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from video_puzzle.ffmpeg_script import IncompleteStateError, build_ffmpeg_args, render_shell_script
-from video_puzzle.layout import (
-    MAX_SLOTS,
-    RESOLUTIONS,
-    AppMode,
-    Layout,
-    canvas_size,
-    grid_output_size,
-    output_size,
+from video_puzzle.encode import (
+    DEFAULT_ENCODER,
+    DEFAULT_QUALITY,
+    EncodeQuality,
+    EncoderKind,
+    estimate_output_bytes,
+    format_size,
 )
+from video_puzzle.encoders import detect_encoders
+from video_puzzle.ffmpeg_script import (
+    IncompleteStateError,
+    build_ffmpeg_args,
+    build_still_args,
+    mosaic_output_size,
+    render_shell_script,
+)
+from video_puzzle.layout import MAX_SLOTS, RESOLUTIONS, AppMode, Layout
 from video_puzzle.probe import ProbeError, probe_video
 from video_puzzle.progress import (
     format_timecode,
@@ -42,6 +56,7 @@ from video_puzzle.progress import (
     render_outcome,
     should_delete_partial_output,
 )
+from video_puzzle.project import ProjectError, load_project, save_project
 from video_puzzle.state import AppState, Slot
 from video_puzzle.sync import SyncError, SyncResult, analyze_slots, apply_sync
 from video_puzzle.thumbnails import ThumbnailError, extract_thumbnail
@@ -74,7 +89,7 @@ class ThumbnailWorker(QThread):
 
 
 class ProbeWorker(QThread):
-    succeeded = Signal(int, float, bool)
+    succeeded = Signal(int, float, bool, float)
     failed = Signal(int, str)
 
     def __init__(self, index: int, video: Path) -> None:
@@ -85,9 +100,31 @@ class ProbeWorker(QThread):
     def run(self) -> None:
         try:
             result = probe_video(self._video)
-            self.succeeded.emit(self._index, result.duration, result.has_audio)
+            self.succeeded.emit(self._index, result.duration, result.has_audio, result.fps or 0.0)
         except ProbeError as exc:
             self.failed.emit(self._index, str(exc))
+
+
+class StillWorker(QThread):
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, args: list[str], dest: Path) -> None:
+        super().__init__()
+        self._args = args
+        self._dest = dest
+
+    def run(self) -> None:
+        try:
+            self._dest.parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(self._args, capture_output=True, text=True, check=False)
+            if result.returncode != 0 or not self._dest.is_file():
+                detail = (result.stderr or result.stdout or "").strip()
+                self.failed.emit(detail or "Не удалось собрать кадр склейки")
+                return
+            self.succeeded.emit(str(self._dest))
+        except OSError as exc:
+            self.failed.emit(str(exc))
 
 
 class SyncWorker(QThread):
@@ -113,14 +150,18 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Video Puzzle")
-        self.resize(1180, 780)
         self.state = AppState()
+        self._settings = QSettings()
+        self._encoders = detect_encoders()
         self._thumb_gen = [0] * MAX_SLOTS
         self._workers: list[QThread] = []
         self._proc: QProcess | None = None
+        self._still_worker: StillWorker | None = None
         self._render_total = 0.0
         self._render_cancelled = False
         self._render_output: Path | None = None
+        self._render_log = ""
+        self._progress_buf = ""
         self._closing = False
         self._cache = (
             Path(
@@ -141,8 +182,14 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_sidebar())
-        right = QVBoxLayout()
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setObjectName("mainSplitter")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(8)
+
+        right_pane = QWidget()
+        right = QVBoxLayout(right_pane)
+        right.setContentsMargins(0, 0, 0, 0)
         self.canvas = PreviewCanvas()
         right.addWidget(self.canvas, 1)
         self.puzzle_extras = QWidget()
@@ -198,17 +245,30 @@ class MainWindow(QMainWindow):
         )
         self.script_view.setFixedHeight(120)
         right.addWidget(self.script_view)
-        root.addLayout(right, 1)
+        extra_row = QHBoxLayout()
+        self.preview_mosaic_btn = QPushButton("Кадр склейки")
+        self.preview_mosaic_btn.setObjectName("secondary")
+        self.preview_mosaic_btn.clicked.connect(self._preview_mosaic)
+        extra_row.addWidget(self.preview_mosaic_btn)
+        extra_row.addStretch(1)
+        right.addLayout(extra_row)
+        self.splitter.addWidget(self._build_sidebar())
+        self.splitter.addWidget(right_pane)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        root.addWidget(self.splitter)
 
         for slot in self.canvas.slots:
             self._bind_slot(slot)
 
+        self._restore_settings()
         self._sync_ui()
+        if not self._geometry_restored:
+            self.resize(1180, 780)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(300)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(16, 18, 16, 16)
         layout.setSpacing(10)
@@ -220,6 +280,16 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(hint)
+        project_row = QHBoxLayout()
+        self.open_project_btn = QPushButton("Открыть проект…")
+        self.open_project_btn.setObjectName("secondary")
+        self.save_project_btn = QPushButton("Сохранить проект…")
+        self.save_project_btn.setObjectName("secondary")
+        self.open_project_btn.clicked.connect(self._open_project)
+        self.save_project_btn.clicked.connect(self._save_project)
+        project_row.addWidget(self.open_project_btn)
+        project_row.addWidget(self.save_project_btn)
+        layout.addLayout(project_row)
 
         mode = QGroupBox("Режим")
         mode_layout = QVBoxLayout(mode)
@@ -243,43 +313,37 @@ class MainWindow(QMainWindow):
         self.count_group = QButtonGroup(self)
         for button in (self.radio_2, self.radio_3, self.radio_4):
             self.count_group.addButton(button)
-            scheme_layout.addWidget(button)
 
-        two_wrap = QWidget()
-        two_layout = QVBoxLayout(two_wrap)
+        self.two_wrap = QWidget()
+        two_layout = QVBoxLayout(self.two_wrap)
         two_layout.setContentsMargins(18, 0, 0, 0)
-        two_label = QLabel("Для двух файлов")
-        two_label.setObjectName("hint")
         self.radio_h = QRadioButton("Горизонтально")
         self.radio_v = QRadioButton("Вертикально")
         self.radio_h.setChecked(True)
         self.orient_group = QButtonGroup(self)
         self.orient_group.addButton(self.radio_h)
         self.orient_group.addButton(self.radio_v)
-        two_layout.addWidget(two_label)
         two_layout.addWidget(self.radio_h)
         two_layout.addWidget(self.radio_v)
-        self.radio_h.setEnabled(False)
-        self.radio_v.setEnabled(False)
-        scheme_layout.addWidget(two_wrap)
 
-        pyramid_wrap = QWidget()
-        pyramid_layout = QVBoxLayout(pyramid_wrap)
+        self.pyramid_wrap = QWidget()
+        pyramid_layout = QVBoxLayout(self.pyramid_wrap)
         pyramid_layout.setContentsMargins(18, 0, 0, 0)
-        pyramid_label = QLabel("Для трёх файлов")
-        pyramid_label.setObjectName("hint")
         self.radio_pyramid_wide = QRadioButton("Широкая пирамида")
         self.radio_pyramid_narrow = QRadioButton("Узкая пирамида")
         self.radio_pyramid_wide.setChecked(True)
         self.pyramid_group = QButtonGroup(self)
         self.pyramid_group.addButton(self.radio_pyramid_wide)
         self.pyramid_group.addButton(self.radio_pyramid_narrow)
-        pyramid_layout.addWidget(pyramid_label)
         pyramid_layout.addWidget(self.radio_pyramid_wide)
         pyramid_layout.addWidget(self.radio_pyramid_narrow)
-        self.radio_pyramid_wide.setEnabled(False)
-        self.radio_pyramid_narrow.setEnabled(False)
-        scheme_layout.addWidget(pyramid_wrap)
+
+        scheme_layout.addWidget(self.radio_2)
+        scheme_layout.addWidget(self.two_wrap)
+        scheme_layout.addWidget(self.radio_3)
+        scheme_layout.addWidget(self.pyramid_wrap)
+        scheme_layout.addWidget(self.radio_4)
+        self._sync_scheme_options()
         layout.addWidget(self.scheme_box)
 
         self.wall_box = QGroupBox("Сетка видеостены")
@@ -309,22 +373,95 @@ class MainWindow(QMainWindow):
         self.wall_box.setVisible(False)
         layout.addWidget(self.wall_box)
 
-        res = QGroupBox("Разрешение выхода")
+        out_row = QHBoxLayout()
+        res = QGroupBox("Разрешение")
         res_layout = QVBoxLayout(res)
         self.res_group = QButtonGroup(self)
         self.res_buttons: dict[int, QRadioButton] = {}
         for height, (width, _) in RESOLUTIONS.items():
-            button = QRadioButton(f"{height}p  ({width}×{height})")
+            button = QRadioButton(f"{height}p")
+            button.setToolTip(f"{width}×{height}")
             self.res_group.addButton(button)
             self.res_buttons[height] = button
             res_layout.addWidget(button)
         self.res_buttons[1080].setChecked(True)
-        layout.addWidget(res)
+        res_layout.addStretch(1)
+        out_row.addWidget(res)
 
-        self.audio_check = QCheckBox("Звук с первого файла, у которого он есть")
+        quality = QGroupBox("Качество")
+        quality_layout = QVBoxLayout(quality)
+        self.quality_group = QButtonGroup(self)
+        self.quality_buttons: dict[EncodeQuality, QRadioButton] = {}
+        quality_labels = {
+            EncodeQuality.DRAFT: "Быстрое",
+            EncodeQuality.STANDARD: "Обычное",
+            EncodeQuality.HIGH: "Высокое",
+            EncodeQuality.ORIGINAL: "Как оригинал",
+        }
+        quality_tips = {
+            EncodeQuality.DRAFT: "Быстрее и легче, заметнее сжатие.",
+            EncodeQuality.STANDARD: "Баланс размера и качества (как раньше).",
+            EncodeQuality.HIGH: "Меньше артефактов, сборка дольше.",
+            EncodeQuality.ORIGINAL: "Почти без потерь после склейки, файл заметно больше.",
+        }
+        for kind, label in quality_labels.items():
+            button = QRadioButton(label)
+            button.setToolTip(quality_tips[kind])
+            self.quality_group.addButton(button)
+            self.quality_buttons[kind] = button
+            quality_layout.addWidget(button)
+        self.quality_buttons[DEFAULT_QUALITY].setChecked(True)
+        out_row.addWidget(quality)
+        layout.addLayout(out_row)
+
+        encoder = QGroupBox("Кодек")
+        encoder_layout = QVBoxLayout(encoder)
+        self.encoder_group = QButtonGroup(self)
+        self.encoder_buttons: dict[EncoderKind, QRadioButton] = {}
+        encoder_labels = {
+            EncoderKind.AUTO: "Авто (NVENC / QSV / CPU)",
+            EncoderKind.CPU: "CPU  (libx264)",
+            EncoderKind.NVENC: "NVIDIA  (NVENC)",
+            EncoderKind.QSV: "Intel  (QSV)",
+        }
+        for kind, label in encoder_labels.items():
+            button = QRadioButton(label)
+            self.encoder_group.addButton(button)
+            self.encoder_buttons[kind] = button
+            encoder_layout.addWidget(button)
+        self.encoder_buttons[DEFAULT_ENCODER].setChecked(True)
+        if "h264_nvenc" not in self._encoders:
+            self.encoder_buttons[EncoderKind.NVENC].setEnabled(False)
+            self.encoder_buttons[EncoderKind.NVENC].setToolTip(
+                "NVENC недоступен: ffmpeg не смог открыть кодек (часто нет CUDA / libcuda.so.1)."
+            )
+        if "h264_qsv" not in self._encoders:
+            self.encoder_buttons[EncoderKind.QSV].setEnabled(False)
+            self.encoder_buttons[EncoderKind.QSV].setToolTip(
+                "Intel QSV недоступен на этой машине."
+            )
+        layout.addWidget(encoder)
+
+        gap_box = QGroupBox("Зазор между ячейками")
+        gap_layout = QHBoxLayout(gap_box)
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(0, 40)
+        self.gap_spin.setSingleStep(2)
+        self.gap_spin.setSuffix(" px")
+        self.gap_spin.valueChanged.connect(self._on_gap_changed)
+        gap_layout.addWidget(self.gap_spin)
+        layout.addWidget(gap_box)
+
+        self.audio_check = QCheckBox("Включить звук")
         self.audio_check.setChecked(True)
         self.audio_check.toggled.connect(self._on_audio_toggled)
         layout.addWidget(self.audio_check)
+        self.audio_combo = QComboBox()
+        self.audio_combo.currentIndexChanged.connect(self._on_audio_slot_changed)
+        layout.addWidget(self.audio_combo)
+        self.normalize_check = QCheckBox("Нормализовать громкость")
+        self.normalize_check.toggled.connect(self._on_normalize_toggled)
+        layout.addWidget(self.normalize_check)
 
         self.status = QLabel()
         self.status.setObjectName("status")
@@ -355,7 +492,23 @@ class MainWindow(QMainWindow):
         self.radio_pyramid_narrow.toggled.connect(self._on_scheme_changed)
         for button in self.res_buttons.values():
             button.toggled.connect(self._on_resolution_changed)
-        return sidebar
+        for button in self.quality_buttons.values():
+            button.toggled.connect(self._on_quality_changed)
+        for button in self.encoder_buttons.values():
+            button.toggled.connect(self._on_encoder_changed)
+        return self._wrap_sidebar(sidebar)
+
+    def _wrap_sidebar(self, sidebar: QWidget) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebarScroll")
+        scroll.setWidget(sidebar)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setMinimumWidth(240)
+        scroll.setMaximumWidth(640)
+        scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        return scroll
 
     def _build_range_row(self) -> QWidget:
         row = QWidget()
@@ -403,6 +556,18 @@ class MainWindow(QMainWindow):
         widget.files_dropped.connect(self._on_files_dropped)
         widget.cleared.connect(self._on_slot_cleared)
         widget.trim_requested.connect(self._open_trim_editor)
+        widget.swap_requested.connect(self._on_slots_swapped)
+
+    def _apply_canvas_layout(self) -> None:
+        gap = max(8, self.state.cell_gap)
+        if self.state.is_wall:
+            created = self.canvas.ensure_slots(self.state.active_count)
+            for widget in created:
+                self._bind_slot(widget)
+            self.canvas.apply_grid(self.state.wall_rows, self.state.wall_cols, gap=gap)
+        else:
+            self.canvas.apply_layout(self.state.layout, gap=gap)
+        self.canvas.set_wall_mode(self.state.is_wall)
 
     def _on_mode_changed(self) -> None:
         wall = self.radio_wall.isChecked()
@@ -411,14 +576,7 @@ class MainWindow(QMainWindow):
         self.wall_box.setVisible(wall)
         self.puzzle_extras.setVisible(not wall)
         self.wall_hint.setVisible(wall)
-        if wall:
-            created = self.canvas.ensure_slots(self.state.active_count)
-            for widget in created:
-                self._bind_slot(widget)
-            self.canvas.apply_grid(self.state.wall_rows, self.state.wall_cols)
-        else:
-            self.canvas.apply_layout(self.state.layout)
-        self.canvas.set_wall_mode(wall)
+        self._apply_canvas_layout()
         self._sync_ui()
         self._refresh_all_thumbnails()
 
@@ -426,11 +584,7 @@ class MainWindow(QMainWindow):
         if not self.state.is_wall:
             return
         self.state.set_wall_grid(self.rows_spin.value(), self.cols_spin.value())
-        created = self.canvas.ensure_slots(self.state.active_count)
-        for widget in created:
-            self._bind_slot(widget)
-        self.canvas.apply_grid(self.state.wall_rows, self.state.wall_cols)
-        self.canvas.set_wall_mode(True)
+        self._apply_canvas_layout()
         self._sync_ui()
 
     def _open_trim_editor(self, index: int) -> None:
@@ -442,7 +596,14 @@ class MainWindow(QMainWindow):
             return
         mark_in, mark_out = editor.marks()
         slot.set_marks(mark_in, mark_out)
+        slot.rotation = editor.rotation()
+        slot.crop = editor.crop()
         self._refresh_thumbnail(index, loading=False)
+        self._sync_ui()
+
+    def _on_slots_swapped(self, source: int, dest: int) -> None:
+        self.state.swap_slots(source, dest)
+        self._refresh_all_thumbnails()
         self._sync_ui()
 
     def _auto_wall_fragments(self) -> None:
@@ -502,18 +663,23 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
-    def _on_scheme_changed(self) -> None:
+    def _sync_scheme_options(self) -> None:
         two = self.radio_2.isChecked()
         three = self.radio_3.isChecked()
+        self.two_wrap.setVisible(two)
+        self.pyramid_wrap.setVisible(three)
         self.radio_h.setEnabled(two)
         self.radio_v.setEnabled(two)
         self.radio_pyramid_wide.setEnabled(three)
         self.radio_pyramid_narrow.setEnabled(three)
+
+    def _on_scheme_changed(self) -> None:
+        self._sync_scheme_options()
         layout = self._selected_layout()
         if layout is self.state.layout:
             return
         self.state.set_layout(layout)
-        self.canvas.apply_layout(layout)
+        self._apply_canvas_layout()
         self._sync_ui()
         self._refresh_all_thumbnails()
 
@@ -524,8 +690,41 @@ class MainWindow(QMainWindow):
                 self._sync_ui()
                 return
 
+    def _on_quality_changed(self) -> None:
+        for quality, button in self.quality_buttons.items():
+            if button.isChecked():
+                self.state.set_quality(quality)
+                self._settings.setValue("quality", str(quality))
+                self._sync_ui()
+                return
+
+    def _on_encoder_changed(self) -> None:
+        for kind, button in self.encoder_buttons.items():
+            if button.isChecked():
+                self.state.set_encoder(kind)
+                self._settings.setValue("encoder", str(kind))
+                self._sync_ui()
+                return
+
+    def _on_gap_changed(self, value: int) -> None:
+        self.state.set_cell_gap(value)
+        self._settings.setValue("cellGap", self.state.cell_gap)
+        self._apply_canvas_layout()
+        self._sync_ui()
+
     def _on_audio_toggled(self, checked: bool) -> None:
         self.state.include_audio = checked
+        self.audio_combo.setEnabled(checked)
+        self.normalize_check.setEnabled(checked)
+        self._sync_ui()
+
+    def _on_audio_slot_changed(self, index: int) -> None:
+        data = self.audio_combo.itemData(index)
+        self.state.audio_slot = int(data) if data is not None else None
+        self._sync_ui()
+
+    def _on_normalize_toggled(self, checked: bool) -> None:
+        self.state.normalize_audio = checked
         self._sync_ui()
 
     def _on_range_toggled(self, checked: bool) -> None:
@@ -544,8 +743,7 @@ class MainWindow(QMainWindow):
         if end <= start:
             end = start + 0.04
         self.state.set_output_range(start, end)
-        self._sync_range_widgets()
-        self._sync_script_preview()
+        self._sync_ui()
 
     def _mark_start(self) -> None:
         if not self.state.range_enabled:
@@ -593,11 +791,215 @@ class MainWindow(QMainWindow):
         else:
             self.timeline.set_range_label(None, None)
 
-    def _sync_script_preview(self) -> None:
-        if self.state.missing_slot_indexes():
-            self.script_view.setPlainText("")
+    def _restore_settings(self) -> None:
+        self._geometry_restored = False
+        geometry = self._settings.value("geometry")
+        if geometry is not None:
+            self._geometry_restored = bool(self.restoreGeometry(geometry))
+        quality_raw = self._settings.value("quality")
+        if quality_raw:
+            try:
+                quality = EncodeQuality(str(quality_raw))
+            except ValueError:
+                quality = None
+            if quality is not None and quality in self.quality_buttons:
+                self.quality_buttons[quality].setChecked(True)
+                self.state.set_quality(quality)
+        encoder_raw = self._settings.value("encoder")
+        if encoder_raw:
+            try:
+                encoder = EncoderKind(str(encoder_raw))
+            except ValueError:
+                encoder = None
+            if encoder is not None and encoder in self.encoder_buttons:
+                button = self.encoder_buttons[encoder]
+                if button.isEnabled():
+                    button.setChecked(True)
+                    self.state.set_encoder(encoder)
+        gap_raw = self._settings.value("cellGap")
+        if gap_raw is not None:
+            try:
+                gap = int(gap_raw)
+            except (TypeError, ValueError):
+                gap = None
+            if gap is not None:
+                self.gap_spin.blockSignals(True)
+                self.gap_spin.setValue(gap)
+                self.gap_spin.blockSignals(False)
+                self.state.set_cell_gap(gap)
+        splitter_state = self._settings.value("splitter")
+        if splitter_state is None or not self.splitter.restoreState(splitter_state):
+            self.splitter.setSizes([300, 880])
+        self._apply_canvas_layout()
+
+    def _scheme_widgets(self) -> list[QWidget]:
+        return [
+            self.radio_puzzle,
+            self.radio_wall,
+            self.radio_2,
+            self.radio_3,
+            self.radio_4,
+            self.radio_h,
+            self.radio_v,
+            self.radio_pyramid_wide,
+            self.radio_pyramid_narrow,
+            self.rows_spin,
+            self.cols_spin,
+            self.gap_spin,
+            self.audio_check,
+            self.normalize_check,
+            *self.res_buttons.values(),
+            *self.quality_buttons.values(),
+            *self.encoder_buttons.values(),
+        ]
+
+    def _apply_state_to_widgets(self) -> None:
+        for index in range(len(self._thumb_gen)):
+            self._thumb_gen[index] += 1
+        widgets = self._scheme_widgets()
+        for widget in widgets:
+            widget.blockSignals(True)
+        wall = self.state.is_wall
+        self.radio_wall.setChecked(wall)
+        self.radio_puzzle.setChecked(not wall)
+        layout = self.state.layout
+        if layout in {Layout.TWO_HORIZONTAL, Layout.TWO_VERTICAL}:
+            self.radio_2.setChecked(True)
+            self.radio_h.setChecked(layout is Layout.TWO_HORIZONTAL)
+            self.radio_v.setChecked(layout is Layout.TWO_VERTICAL)
+        elif layout is Layout.THREE_PYRAMID_NARROW:
+            self.radio_3.setChecked(True)
+            self.radio_pyramid_narrow.setChecked(True)
+        elif layout is Layout.THREE_PYRAMID:
+            self.radio_3.setChecked(True)
+            self.radio_pyramid_wide.setChecked(True)
+        else:
+            self.radio_4.setChecked(True)
+        self._sync_scheme_options()
+        self.rows_spin.setValue(self.state.wall_rows)
+        self.cols_spin.setValue(self.state.wall_cols)
+        if self.state.resolution in self.res_buttons:
+            self.res_buttons[self.state.resolution].setChecked(True)
+        if self.state.quality in self.quality_buttons:
+            self.quality_buttons[self.state.quality].setChecked(True)
+        encoder_button = self.encoder_buttons.get(self.state.encoder)
+        if encoder_button is not None and encoder_button.isEnabled():
+            encoder_button.setChecked(True)
+        else:
+            self.encoder_buttons[DEFAULT_ENCODER].setChecked(True)
+            self.state.set_encoder(DEFAULT_ENCODER)
+        self.gap_spin.setValue(self.state.cell_gap)
+        self.audio_check.setChecked(self.state.include_audio)
+        self.normalize_check.setChecked(self.state.normalize_audio)
+        self.scheme_box.setVisible(not wall)
+        self.wall_box.setVisible(wall)
+        self.puzzle_extras.setVisible(not wall)
+        self.wall_hint.setVisible(wall)
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._apply_canvas_layout()
+        count = self.state.active_count
+        for index, widget in enumerate(self.canvas.slots):
+            slot = self.state.slots[index] if index < len(self.state.slots) else None
+            if index >= count or slot is None or slot.path is None:
+                widget.set_empty()
+                continue
+            self._probe_slot(index, slot.path)
+            self._request_thumbnail(index, slot.path, loading=True)
+        self._sync_ui()
+
+    def _save_project(self) -> None:
+        last = self._settings.value("lastProjectDir") or str(Path.home())
+        suggested = str(Path(str(last)) / "puzzle.vproj")
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить проект",
+            suggested,
+            "Проект Video Puzzle (*.vproj *.json);;Все файлы (*)",
+        )
+        if not chosen:
             return
-        self.script_view.setPlainText(render_shell_script(self.state, Path("mosaic.mp4")))
+        path = Path(chosen)
+        if path.suffix.lower() not in {".vproj", ".json"}:
+            path = path.with_suffix(".vproj")
+        try:
+            save_project(self.state, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Проект", f"Не удалось сохранить проект: {exc}")
+            return
+        self._settings.setValue("lastProjectDir", str(path.parent))
+        QMessageBox.information(self, "Проект", f"Сохранено: {path}")
+
+    def _open_project(self) -> None:
+        last = (
+            self._settings.value("lastProjectDir")
+            or self._settings.value("lastOutputDir")
+            or str(Path.home())
+        )
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть проект",
+            str(last),
+            "Проект Video Puzzle (*.vproj *.json);;Все файлы (*)",
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            self.state = load_project(path)
+        except ProjectError as exc:
+            QMessageBox.warning(self, "Проект", str(exc))
+            return
+        self._settings.setValue("lastProjectDir", str(path.parent))
+        self._apply_state_to_widgets()
+
+    def _preview_mosaic(self) -> None:
+        if self._still_worker is not None:
+            return
+        dest = self._cache / "mosaic-preview.jpg"
+        try:
+            args = build_still_args(self.state, dest)
+        except IncompleteStateError as exc:
+            QMessageBox.warning(self, "Кадр склейки", str(exc))
+            return
+        self.preview_mosaic_btn.setEnabled(False)
+        worker = StillWorker(args, dest)
+        worker.succeeded.connect(self._on_still_ok)
+        worker.failed.connect(self._on_still_fail)
+        worker.finished.connect(self._on_still_finished)
+        self._still_worker = worker
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_still_ok(self, image: str) -> None:
+        pixmap = QPixmap(image)
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Кадр склейки", "Не удалось открыть кадр.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Кадр склейки")
+        layout = QVBoxLayout(dialog)
+        preview = QLabel()
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scaled = pixmap.scaled(
+            960,
+            540,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        preview.setPixmap(scaled)
+        layout.addWidget(preview)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def _on_still_fail(self, message: str) -> None:
+        QMessageBox.warning(self, "Кадр склейки", message)
+
+    def _on_still_finished(self) -> None:
+        self._still_worker = None
+        self._sync_ui()
 
     def _on_file_picked(self, index: int, path: Path) -> None:
         self.state.set_slot(index, path)
@@ -638,10 +1040,10 @@ class MainWindow(QMainWindow):
         self._track_worker(worker)
         worker.start()
 
-    def _on_probe_ok(self, index: int, duration: float, has_audio: bool) -> None:
+    def _on_probe_ok(self, index: int, duration: float, has_audio: bool, fps: float = 0.0) -> None:
         if self.state.slots[index].path is None:
             return
-        self.state.set_probe(index, duration, has_audio)
+        self.state.set_probe(index, duration, has_audio, fps if fps > 0 else None)
         if self.state.playhead == 0.0:
             overlap = self.state.overlap_duration()
             if overlap is not None and overlap > 1.0:
@@ -741,18 +1143,14 @@ class MainWindow(QMainWindow):
         self.timeline.set_position(self.state.playhead)
         self._sync_range_widgets()
         self._update_slot_badges()
+        self._sync_audio_combo()
+        self.preview_mosaic_btn.setEnabled(ready and self._still_worker is None)
         if missing:
             n = len(missing)
             self.status.setText(f"Нужно выбрать ещё {n} {_plural_files(n)}.")
             self.script_view.setPlainText("")
             return
-        canvas_w, canvas_h = canvas_size(self.state.resolution)
-        if self.state.is_wall:
-            out_w, out_h = grid_output_size(
-                self.state.wall_cols, self.state.wall_rows, canvas_w, canvas_h
-            )
-        else:
-            out_w, out_h = output_size(self.state.layout, canvas_w, canvas_h)
+        out_w, out_h = mosaic_output_size(self.state)
         extra = ""
         spread = self.state.duration_spread()
         if spread is not None and spread >= 0.2:
@@ -767,14 +1165,58 @@ class MainWindow(QMainWindow):
             end = self.state.resolved_range_end()
             if end is not None:
                 fragment = f" · фрагмент {start:.2f}–{end:.2f} с"
+        size_note = ""
+        duration = self.state.export_duration()
+        if duration:
+            nbytes = estimate_output_bytes(
+                width=out_w,
+                height=out_h,
+                fps=self.state.output_fps(),
+                duration=duration,
+                quality=self.state.quality,
+                has_audio=self.state.audio_input_index() is not None,
+            )
+            size_note = f" · ~{format_size(nbytes)}"
         if running:
             self.status.setText("Идёт сборка видео… Можно остановить.")
         else:
-            self.status.setText(f"Готово · выход {out_w}×{out_h}{extra}{fragment}")
-        self.script_view.setPlainText(render_shell_script(self.state, Path("mosaic.mp4")))
+            self.status.setText(
+                f"Готово · выход {out_w}×{out_h} · {_quality_status(self.state.quality)}"
+                f" · {self.state.output_fps():.2f} fps{size_note}{extra}{fragment}"
+            )
+        self.script_view.setPlainText(
+            render_shell_script(self.state, Path("mosaic.mp4"), available_encoders=self._encoders)
+        )
+
+    def _sync_audio_combo(self) -> None:
+        self.audio_combo.blockSignals(True)
+        self.audio_combo.clear()
+        self.audio_combo.addItem("Авто (первый со звуком)", None)
+        for index, slot in enumerate(self.state.active_slots()):
+            if slot.path is None:
+                continue
+            label = f"Слот {index + 1} — {slot.path.name}"
+            if not slot.has_audio:
+                label += " (нет звука)"
+            self.audio_combo.addItem(label, index)
+        target = self.state.audio_slot
+        found = 0
+        if target is not None:
+            for i in range(self.audio_combo.count()):
+                if self.audio_combo.itemData(i) == target:
+                    found = i
+                    break
+        self.audio_combo.setCurrentIndex(found)
+        self.audio_combo.setEnabled(self.state.include_audio)
+        self.normalize_check.blockSignals(True)
+        self.normalize_check.setChecked(self.state.normalize_audio)
+        self.normalize_check.blockSignals(False)
+        self.normalize_check.setEnabled(self.state.include_audio)
+        self.audio_combo.blockSignals(False)
 
     def _pick_output(self) -> Path | None:
-        suggested = str(Path.home() / "mosaic.mp4")
+        last = self._settings.value("lastOutputDir") or str(Path.home())
+        suggested = str(Path(str(last)) / "mosaic.mp4")
         chosen, _ = QFileDialog.getSaveFileName(
             self,
             "Куда сохранить готовое видео",
@@ -786,6 +1228,7 @@ class MainWindow(QMainWindow):
         output = Path(chosen)
         if output.suffix.lower() != ".mp4":
             output = output.with_suffix(".mp4")
+        self._settings.setValue("lastOutputDir", str(output.parent))
         return output
 
     def _save_script(self) -> None:
@@ -796,7 +1239,7 @@ class MainWindow(QMainWindow):
             return
         script_path = output.with_suffix(".sh")
         try:
-            text = render_shell_script(self.state, output)
+            text = render_shell_script(self.state, output, available_encoders=self._encoders)
         except IncompleteStateError as exc:
             QMessageBox.warning(self, "Не хватает файлов", str(exc))
             return
@@ -814,14 +1257,41 @@ class MainWindow(QMainWindow):
         output = self._pick_output()
         if output is None:
             return
+        out_w, out_h = mosaic_output_size(self.state)
+        duration = self.state.export_duration() or 0.0
+        if duration > 0:
+            nbytes = estimate_output_bytes(
+                width=out_w,
+                height=out_h,
+                fps=self.state.output_fps(),
+                duration=duration,
+                quality=self.state.quality,
+                has_audio=self.state.audio_input_index() is not None,
+            )
+            answer = QMessageBox.question(
+                self,
+                "Сборка",
+                f"Выход {out_w}×{out_h}, примерно {format_size(nbytes)}.\nПродолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         try:
-            args = build_ffmpeg_args(self.state, output, overwrite=True, progress=True)
+            args = build_ffmpeg_args(
+                self.state,
+                output,
+                overwrite=True,
+                progress=True,
+                available_encoders=self._encoders,
+            )
         except IncompleteStateError as exc:
             QMessageBox.warning(self, "Не хватает файлов", str(exc))
             return
         self._render_total = self.state.export_duration() or 0.0
         self._render_cancelled = False
         self._render_output = output
+        self._render_log = ""
+        self._progress_buf = ""
         if self._render_total > 0:
             self.progress.setRange(0, 1000)
             self.progress.setValue(0)
@@ -860,7 +1330,10 @@ class MainWindow(QMainWindow):
         if self._proc is None:
             return
         text = bytes(self._proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        for line in text.splitlines():
+        chunk = self._progress_buf + text
+        parts = chunk.split("\n")
+        self._progress_buf = parts[-1]
+        for line in parts[:-1]:
             current = parse_progress_seconds(line)
             if current is None or self._render_total <= 0:
                 continue
@@ -869,15 +1342,20 @@ class MainWindow(QMainWindow):
     def _on_ffmpeg_stderr(self) -> None:
         if self._proc is None:
             return
-        self._proc.readAllStandardError()
+        text = bytes(self._proc.readAllStandardError()).decode("utf-8", errors="replace")
+        self._render_log += text
+        if len(self._render_log) > 32_000:
+            self._render_log = self._render_log[-16_000:]
 
     def _on_ffmpeg_finished(self, code: int, _status) -> None:
-        proc = self._proc
         cancelled = self._render_cancelled
         output = self._render_output
+        log = self._render_log
         self._proc = None
         self._render_cancelled = False
         self._render_output = None
+        self._render_log = ""
+        self._progress_buf = ""
         self._sync_ui()
         if self._closing:
             return
@@ -888,12 +1366,28 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Сборка остановлена", "Сборка видео прервана.")
             return
         if outcome == "success":
-            QMessageBox.information(self, "Готово", "Видео собрано.")
+            box = QMessageBox(self)
+            box.setWindowTitle("Готово")
+            box.setText("Видео собрано.")
+            open_file = box.addButton("Открыть файл", QMessageBox.ButtonRole.AcceptRole)
+            open_folder = box.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+            box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if output is not None and clicked is open_file:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(output)))
+            elif output is not None and clicked is open_folder:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
             return
-        err = ""
-        if proc is not None:
-            err = bytes(proc.readAllStandardError()).decode("utf-8", errors="replace").strip()
-        QMessageBox.warning(self, "ffmpeg", err or f"ffmpeg завершился с кодом {code}")
+        err = log.strip()
+        message = err or f"ffmpeg завершился с кодом {code}"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("ffmpeg")
+        box.setText(message if len(message) < 400 else f"ffmpeg завершился с кодом {code}")
+        if err:
+            box.setDetailedText(err[-4000:])
+        box.exec()
 
     def _track_worker(self, worker: QThread) -> None:
         worker.finished.connect(
@@ -903,13 +1397,29 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.setValue("splitter", self.splitter.saveState())
+        self._settings.setValue("quality", str(self.state.quality))
+        self._settings.setValue("encoder", str(self.state.encoder))
+        self._settings.setValue("cellGap", self.state.cell_gap)
         if self._proc is not None:
             self._render_cancelled = True
             self._proc.kill()
             self._proc.waitForFinished(500)
+        if self._still_worker is not None:
+            self._still_worker.wait(200)
         for worker in list(self._workers):
             worker.wait(200)
         super().closeEvent(event)
+
+
+def _quality_status(quality: EncodeQuality) -> str:
+    return {
+        EncodeQuality.DRAFT: "быстрое",
+        EncodeQuality.STANDARD: "обычное",
+        EncodeQuality.HIGH: "высокое",
+        EncodeQuality.ORIGINAL: "как оригинал",
+    }[quality]
 
 
 def _plural_files(n: int) -> str:

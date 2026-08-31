@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QKeyEvent, QPixmap, QResizeEvent
-from PySide6.QtWidgets import (
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QTransform,
 )
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from video_puzzle.progress import format_timecode
 from video_puzzle.state import Slot
@@ -38,21 +41,117 @@ class _FrameWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class CropPreview(QLabel):
+    """Frame preview with optional rubber-band crop in normalized coordinates."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(QSize(480, 270))
+        self.setObjectName("trimPreview")
+        self._source: QPixmap | None = None
+        self._crop: tuple[float, float, float, float] | None = None
+        self._origin: QPoint | None = None
+
+    def set_source(self, pixmap: QPixmap | None) -> None:
+        self._source = pixmap
+        self.update()
+
+    def set_crop(self, crop: tuple[float, float, float, float] | None) -> None:
+        self._crop = crop
+        self.update()
+
+    def crop(self) -> tuple[float, float, float, float] | None:
+        return self._crop
+
+    def clear_crop(self) -> None:
+        self._crop = None
+        self.update()
+
+    def _image_rect(self) -> QRect:
+        if self._source is None or self._source.isNull():
+            return QRect()
+        scaled = self._source.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        return QRect(x, y, scaled.width(), scaled.height())
+
+    def _to_norm(self, rect: QRect) -> tuple[float, float, float, float] | None:
+        image = self._image_rect()
+        if image.width() < 2 or image.height() < 2:
+            return None
+        clipped = rect.intersected(image)
+        if clipped.width() < 8 or clipped.height() < 8:
+            return None
+        return (
+            (clipped.x() - image.x()) / image.width(),
+            (clipped.y() - image.y()) / image.height(),
+            clipped.width() / image.width(),
+            clipped.height() / image.height(),
+        )
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        image = self._image_rect()
+        if self._source is not None and not self._source.isNull() and image.isValid():
+            scaled = self._source.scaled(
+                image.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            painter.drawPixmap(image.topLeft(), scaled)
+        if self._crop is not None and image.isValid():
+            x, y, w, h = self._crop
+            box = QRect(
+                image.x() + int(x * image.width()),
+                image.y() + int(y * image.height()),
+                max(1, int(w * image.width())),
+                max(1, int(h * image.height())),
+            )
+            painter.setPen(QPen(QColor("#3d8bfd"), 2))
+            painter.drawRect(box)
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._origin = event.position().toPoint()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._origin is None:
+            return
+        current = QRect(self._origin, event.position().toPoint()).normalized()
+        self._crop = self._to_norm(current)
+        self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._origin = None
+        super().mouseReleaseEvent(event)
+
+
 class TrimEditor(QDialog):
-    """Source-monitor style in/out editor (I/O, scrub, nudge)."""
+    """Source-monitor style in/out editor (I/O, scrub, nudge, crop, rotate)."""
 
     def __init__(self, slot: Slot, cache: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Разметка фрагмента")
-        self.resize(820, 560)
+        self.resize(860, 620)
         assert slot.path is not None
         self._path = slot.path
         self._duration = slot.duration or 0.0
+        self._fps = slot.fps if slot.fps else 30.0
         self._cache = cache
         self._gen = 0
         self._worker: _FrameWorker | None = None
         self._frame_pending = False
         self._closed = False
+        self._rotation = slot.rotation % 360
         default_out = self._duration if self._duration > 0 else 1.0
         self._mark_in = slot.mark_in if slot.mark_in is not None else 0.0
         self._mark_out = slot.mark_out if slot.mark_out is not None else default_out
@@ -61,11 +160,9 @@ class TrimEditor(QDialog):
         )
         self._playhead = self._mark_in
 
-        self.preview = QLabel("Кадр")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(QSize(480, 270))
-        self.preview.setObjectName("trimPreview")
-        self._pixmap: QPixmap | None = None
+        self.preview = CropPreview(self)
+        self.preview.set_crop(slot.crop)
+        self._raw: QPixmap | None = None
 
         self.timeline = TimelineBar()
         self.timeline.position_chosen.connect(self._on_scrub)
@@ -75,7 +172,9 @@ class TrimEditor(QDialog):
         self.status.setObjectName("hint")
         self.status.setWordWrap(True)
 
-        keys = QLabel("I — вход  ·  O — выход  ·  ←/→ кадр  ·  Shift+←/→ 1 с  ·  Home/End")
+        keys = QLabel(
+            "I/O · ←/→ кадр · Shift+←/→ 1 с · Home/End · на кадре зажмите мышь, чтобы кропнуть"
+        )
         keys.setObjectName("hint")
 
         row = QHBoxLayout()
@@ -94,16 +193,28 @@ class TrimEditor(QDialog):
             row.addWidget(button)
 
         nudge = QHBoxLayout()
+        frame = 1 / self._fps
         for label, delta in (
             ("-1 с", -1.0),
-            ("-1 кадр", -1 / 30),
-            ("+1 кадр", 1 / 30),
+            ("-1 кадр", -frame),
+            ("+1 кадр", frame),
             ("+1 с", 1.0),
         ):
             button = QPushButton(label)
             button.setObjectName("secondary")
             button.clicked.connect(lambda _=False, d=delta: self._nudge(d))
             nudge.addWidget(button)
+
+        geo = QHBoxLayout()
+        for label, delta in (("↺ 90°", -90), ("180°", 180), ("↻ 90°", 90)):
+            button = QPushButton(label)
+            button.setObjectName("secondary")
+            button.clicked.connect(lambda _=False, d=delta: self._rotate(d))
+            geo.addWidget(button)
+        reset_crop = QPushButton("Сбросить кроп")
+        reset_crop.setObjectName("secondary")
+        reset_crop.clicked.connect(self.preview.clear_crop)
+        geo.addWidget(reset_crop)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -122,6 +233,7 @@ class TrimEditor(QDialog):
         layout.addWidget(self.status)
         layout.addLayout(row)
         layout.addLayout(nudge)
+        layout.addLayout(geo)
         layout.addWidget(keys)
         layout.addLayout(buttons)
 
@@ -136,6 +248,26 @@ class TrimEditor(QDialog):
 
     def marks(self) -> tuple[float, float]:
         return clamp_marks(self._duration or self._mark_out, self._mark_in, self._mark_out)
+
+    def rotation(self) -> int:
+        return self._rotation % 360
+
+    def crop(self) -> tuple[float, float, float, float] | None:
+        return self.preview.crop()
+
+    def _rotate(self, delta: int) -> None:
+        self._rotation = (self._rotation + delta) % 360
+        self._apply_transform()
+
+    def _apply_transform(self) -> None:
+        if self._raw is None or self._raw.isNull():
+            return
+        pixmap = self._raw
+        if self._rotation:
+            pixmap = pixmap.transformed(
+                QTransform().rotate(self._rotation), Qt.TransformationMode.SmoothTransformation
+            )
+        self.preview.set_source(pixmap)
 
     def _on_scrub(self, seconds: float) -> None:
         self._playhead = self._clamp_playhead(seconds)
@@ -175,12 +307,14 @@ class TrimEditor(QDialog):
 
     def _refresh_status(self) -> None:
         length = max(0.0, self._mark_out - self._mark_in)
+        rot = f"  ·  поворот {self._rotation}°" if self._rotation else ""
+        crop = "  ·  кроп" if self.preview.crop() else ""
         self.status.setText(
             f"{self._path.name}\n"
             f"Курсор {format_timecode(self._playhead)}  ·  "
             f"In {format_timecode(self._mark_in)}  ·  "
             f"Out {format_timecode(self._mark_out)}  ·  "
-            f"Длина {format_timecode(length)}"
+            f"Длина {format_timecode(length)}{rot}{crop}"
         )
         self.timeline.set_range_label(self._mark_in, self._mark_out)
 
@@ -203,8 +337,8 @@ class TrimEditor(QDialog):
     def _on_frame(self, image: str) -> None:
         if self._closed:
             return
-        self._pixmap = QPixmap(image)
-        self._scale()
+        self._raw = QPixmap(image)
+        self._apply_transform()
 
     def _on_frame_fail(self, message: str) -> None:
         if not self._closed:
@@ -217,16 +351,6 @@ class TrimEditor(QDialog):
             return
         if self._frame_pending:
             self._pull_frame()
-
-    def _scale(self) -> None:
-        if self._pixmap is None or self._pixmap.isNull():
-            return
-        scaled = self._pixmap.scaled(
-            self.preview.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.preview.setPixmap(scaled)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_worker()
@@ -247,11 +371,12 @@ class TrimEditor(QDialog):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._scale()
+        self.preview.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
         mods = event.modifiers()
+        step = 1 / self._fps
         if key == Qt.Key.Key_I:
             self._mark_in_here()
             return
@@ -259,10 +384,10 @@ class TrimEditor(QDialog):
             self._mark_out_here()
             return
         if key == Qt.Key.Key_Left:
-            self._nudge(-1.0 if mods & Qt.KeyboardModifier.ShiftModifier else -1 / 30)
+            self._nudge(-1.0 if mods & Qt.KeyboardModifier.ShiftModifier else -step)
             return
         if key == Qt.Key.Key_Right:
-            self._nudge(1.0 if mods & Qt.KeyboardModifier.ShiftModifier else 1 / 30)
+            self._nudge(1.0 if mods & Qt.KeyboardModifier.ShiftModifier else step)
             return
         if key == Qt.Key.Key_Home:
             self._playhead = 0.0

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from tests.factories import filled_state, video
+from video_puzzle.encode import EncodeQuality
 from video_puzzle.layout import MAX_SLOTS, AppMode, Layout
 from video_puzzle.state import AppState, Slot, is_video_file
 
@@ -11,6 +12,7 @@ def test_new_state_has_four_empty_slots() -> None:
     state = AppState()
     assert state.layout is Layout.FOUR_SQUARE
     assert state.resolution == 1080
+    assert state.quality is EncodeQuality.STANDARD
     assert all(slot.path is None for slot in state.slots)
     assert not state.is_complete()
     assert state.missing_slot_indexes() == [0, 1, 2, 3]
@@ -23,9 +25,9 @@ def test_is_video_file() -> None:
     assert not is_video_file(Path("a"))
 
 
-def test_rejects_bad_resolution() -> None:
+def test_rejects_bad_quality() -> None:
     with pytest.raises(ValueError):
-        AppState(resolution=99)
+        AppState(quality="ultra")  # type: ignore[arg-type]
 
 
 def test_rejects_wrong_slot_count() -> None:
@@ -206,3 +208,39 @@ def test_wall_source_window_uses_shortest_fragment() -> None:
     assert start1 == pytest.approx(2.0)
     assert end1 == pytest.approx(12.0)
     assert state.file_time(0) == pytest.approx(5.0)
+
+
+def test_output_fps_uses_highest_source() -> None:
+    state = filled_state(Layout.TWO_HORIZONTAL)
+    assert state.output_fps() == pytest.approx(30.0)
+    state.set_probe(0, 5.0, False, fps=24.0)
+    state.set_probe(1, 5.0, False, fps=29.97)
+    assert state.output_fps() == pytest.approx(29.97)
+
+
+def test_swap_slots_exchanges_files() -> None:
+    state = filled_state(Layout.TWO_HORIZONTAL)
+    first, second = state.slots[0].path, state.slots[1].path
+    state.swap_slots(0, 1)
+    assert state.slots[0].path == second
+    assert state.slots[1].path == first
+
+
+def test_audio_slot_overrides_first_with_sound() -> None:
+    state = filled_state(Layout.TWO_HORIZONTAL)
+    state.set_probe(0, 5.0, True)
+    state.set_probe(1, 5.0, True)
+    assert state.audio_input_index() == 0
+    state.audio_slot = 1
+    assert state.audio_input_index() == 1
+    state.audio_slot = 1
+    state.slots[1].has_audio = False
+    assert state.audio_input_index() is None
+
+
+def test_cell_gap_is_even_and_clamped() -> None:
+    state = AppState()
+    state.set_cell_gap(7)
+    assert state.cell_gap == 6
+    state.set_cell_gap(99)
+    assert state.cell_gap == 40

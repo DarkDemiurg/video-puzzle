@@ -26,15 +26,43 @@ def ffprobe_binary() -> str:
 class ProbeResult:
     duration: float
     has_audio: bool
+    fps: float | None = None
+
+
+def parse_frame_rate(raw: object) -> float | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text in {"0/0", "0"}:
+        return None
+    try:
+        if "/" in text:
+            num_s, den_s = text.split("/", 1)
+            num, den = float(num_s), float(den_s)
+            if den == 0:
+                return None
+            value = num / den
+        else:
+            value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or value > 240:
+        return None
+    return value
 
 
 def parse_probe_json(payload: str) -> ProbeResult:
     data = json.loads(payload)
     duration: float | None = None
     has_audio = False
+    fps: float | None = None
     for stream in data.get("streams") or []:
         if stream.get("codec_type") == "audio":
             has_audio = True
+        if stream.get("codec_type") == "video" and fps is None:
+            fps = parse_frame_rate(stream.get("avg_frame_rate")) or parse_frame_rate(
+                stream.get("r_frame_rate")
+            )
         raw = stream.get("duration")
         if raw is not None:
             try:
@@ -54,7 +82,7 @@ def parse_probe_json(payload: str) -> ProbeResult:
                 duration = format_duration
     if duration is None:
         raise ProbeError("ffprobe did not report a duration")
-    return ProbeResult(duration=duration, has_audio=has_audio)
+    return ProbeResult(duration=duration, has_audio=has_audio, fps=fps)
 
 
 def probe_video(
@@ -71,7 +99,7 @@ def probe_video(
         "-show_entries",
         "format=duration",
         "-show_entries",
-        "stream=codec_type,duration",
+        "stream=codec_type,duration,avg_frame_rate,r_frame_rate",
         "-of",
         "json",
         str(video),

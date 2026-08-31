@@ -8,7 +8,8 @@ from video_puzzle.progress import (
 
 
 def test_parse_out_time_ms() -> None:
-    assert parse_progress_seconds("out_time_ms=1500") == 1.5
+    # ffmpeg reports out_time_ms as microseconds (deprecated alias of out_time_us).
+    assert parse_progress_seconds("out_time_ms=1500000") == 1.5
 
 
 def test_parse_out_time_us() -> None:
