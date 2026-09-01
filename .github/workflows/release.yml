@@ -100,7 +100,7 @@ jobs:
         env:
           PYAPP_PROJECT_VERSION: ${{ needs.build-wheel.outputs.version }}
         run: |
-          wheel="$(ls -1 dist/*.whl | head -1)"
+          wheel="$(realpath "$(ls -1 dist/*.whl | head -1)")"
           export PYAPP_PROJECT_PATH="$wheel"
           cd "$PYAPP_DIR"
           cargo build --release
