@@ -29,3 +29,8 @@ Thumbs.db
 *.webm
 *.avi
 *.m4v
+
+# PyApp local build
+.pyapp/
+pyapp-v*/
+pyapp-source.*

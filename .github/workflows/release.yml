@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYAPP_VERSION: "0.29.0"
+  PYAPP_PROJECT_NAME: video-puzzle
+  PYAPP_PYTHON_VERSION: "3.12"
+  PYAPP_EXEC_MODULE: video_puzzle
+  PYAPP_IS_GUI: "true"
+  PYAPP_DISTRIBUTION_EMBED: "true"
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(grep -E '^version = ' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - run: uv build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-binary:
+    needs: build-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: video-puzzle-linux-x86_64
+            target: video-puzzle
+            source: pyapp
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            artifact: video-puzzle-linux-aarch64
+            target: video-puzzle
+            source: pyapp
+            archive_ext: tar.gz
+          - os: windows-2022
+            artifact: video-puzzle-windows-x86_64
+            target: video-puzzle.exe
+            source: pyapp.exe
+            archive_ext: zip
+          - os: macos-14
+            artifact: video-puzzle-macos-aarch64
+            target: video-puzzle
+            source: pyapp
+            archive_ext: tar.gz
+          - os: macos-13
+            artifact: video-puzzle-macos-x86_64
+            target: video-puzzle
+            source: pyapp
+            archive_ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+
+      - name: Fetch PyApp
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/ofek/pyapp/releases/download/v${PYAPP_VERSION}/source.tar.gz" -o pyapp-source.tar.gz
+          tar -xzf pyapp-source.tar.gz
+          echo "PYAPP_DIR=$(echo pyapp-v* | head -1)" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        shell: bash
+        env:
+          PYAPP_PROJECT_VERSION: ${{ needs.build-wheel.outputs.version }}
+        run: |
+          wheel="$(ls -1 dist/*.whl | head -1)"
+          export PYAPP_PROJECT_PATH="$wheel"
+          cd "$PYAPP_DIR"
+          cargo build --release
+          cp "target/release/${{ matrix.source }}" "../${{ matrix.target }}"
+          chmod +x "../${{ matrix.target }}" 2>/dev/null || true
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p bundle
+          cp "${{ matrix.target }}" bundle/
+          cp README.md LICENSE bundle/
+          archive="${{ matrix.artifact }}.${{ matrix.archive_ext }}"
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            (cd bundle && 7z a -r "../$archive" .)
+          else
+            tar -czf "$archive" -C bundle .
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  publish:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: video-puzzle-*
+          merge-multiple: true
+          path: assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: assets/*
