@@ -437,9 +437,7 @@ class MainWindow(QMainWindow):
             )
         if "h264_qsv" not in self._encoders:
             self.encoder_buttons[EncoderKind.QSV].setEnabled(False)
-            self.encoder_buttons[EncoderKind.QSV].setToolTip(
-                "Intel QSV недоступен на этой машине."
-            )
+            self.encoder_buttons[EncoderKind.QSV].setToolTip("Intel QSV недоступен на этой машине.")
         layout.addWidget(encoder)
 
         gap_box = QGroupBox("Зазор между ячейками")

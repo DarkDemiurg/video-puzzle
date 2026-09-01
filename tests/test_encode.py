@@ -81,4 +81,3 @@ def test_probe_encoder_accepts_zero_exit() -> None:
         return CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     assert probe_encoder("h264_nvenc", ffmpeg="ffmpeg", runner=runner) is True
-
