@@ -11,6 +11,10 @@ PYAPP_DIR="${PYAPP_DIR:-$ROOT/.pyapp/pyapp-v${PYAPP_VERSION}}"
 OUTPUT_NAME="${OUTPUT_NAME:-video-puzzle}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/dist/pyapp}"
 
+# python-build-standalone URL used by PyApp 0.29.0 for CPython 3.12 (override per platform).
+PYAPP_PYTHON_DIST_URL="${PYAPP_PYTHON_DIST_URL:-https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz}"
+PYAPP_PYTHON_PATH="${PYAPP_PYTHON_PATH:-python/bin/python3}"
+
 VERSION="$(grep -E '^version = ' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 
 echo "==> Building wheel (video-puzzle $VERSION)"
@@ -24,14 +28,21 @@ if [[ ! -d "$PYAPP_DIR" ]]; then
     | tar -xz -C "$(dirname "$PYAPP_DIR")"
 fi
 
+DIST_ARCHIVE="$ROOT/.pyapp/python-distribution.tar.gz"
+echo "==> Preparing embedded Python distribution"
+chmod +x scripts/prepare-pyapp-distribution.sh
+scripts/prepare-pyapp-distribution.sh "$WHEEL" "$PYAPP_PYTHON_DIST_URL" "$DIST_ARCHIVE"
+
 echo "==> Compiling PyApp binary"
 export PYAPP_PROJECT_NAME=video-puzzle
 export PYAPP_PROJECT_VERSION="$VERSION"
-export PYAPP_PROJECT_PATH="$WHEEL"
 export PYAPP_PYTHON_VERSION=3.12
 export PYAPP_EXEC_MODULE=video_puzzle
 export PYAPP_IS_GUI=1
-export PYAPP_DISTRIBUTION_EMBED=1
+export PYAPP_DISTRIBUTION_PATH="$DIST_ARCHIVE"
+export PYAPP_DISTRIBUTION_PYTHON_PATH="$PYAPP_PYTHON_PATH"
+export PYAPP_SKIP_INSTALL=1
+export PYAPP_FULL_ISOLATION=1
 
 (
   cd "$PYAPP_DIR"

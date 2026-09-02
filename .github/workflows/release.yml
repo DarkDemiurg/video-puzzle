@@ -15,7 +15,8 @@ env:
   PYAPP_PYTHON_VERSION: "3.12"
   PYAPP_EXEC_MODULE: video_puzzle
   PYAPP_IS_GUI: "true"
-  PYAPP_DISTRIBUTION_EMBED: "true"
+  PYAPP_SKIP_INSTALL: "true"
+  PYAPP_FULL_ISOLATION: "true"
 
 jobs:
   build-wheel:
@@ -57,26 +58,36 @@ jobs:
             target: video-puzzle
             source: pyapp
             archive_ext: tar.gz
+            python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+            python_path: python/bin/python3
           - os: ubuntu-24.04-arm
             artifact: video-puzzle-linux-aarch64
             target: video-puzzle
             source: pyapp
             archive_ext: tar.gz
+            python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+            python_path: python/bin/python3
           - os: windows-2022
             artifact: video-puzzle-windows-x86_64
             target: video-puzzle.exe
             source: pyapp.exe
             archive_ext: zip
+            python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-pc-windows-msvc-install_only_stripped.tar.gz
+            python_path: python/python.exe
           - os: macos-14
             artifact: video-puzzle-macos-aarch64
             target: video-puzzle
             source: pyapp
             archive_ext: tar.gz
+            python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-apple-darwin-install_only_stripped.tar.gz
+            python_path: python/bin/python3
           - os: macos-15-intel
             artifact: video-puzzle-macos-x86_64
             target: video-puzzle
             source: pyapp
             archive_ext: tar.gz
+            python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-apple-darwin-install_only_stripped.tar.gz
+            python_path: python/bin/python3
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -95,13 +106,20 @@ jobs:
           tar -xzf pyapp-source.tar.gz
           echo "PYAPP_DIR=$(echo pyapp-v* | head -1)" >> "$GITHUB_ENV"
 
+      - name: Prepare embedded Python distribution
+        shell: bash
+        run: |
+          wheel="$(realpath "$(ls -1 dist/*.whl | head -1)")"
+          chmod +x scripts/prepare-pyapp-distribution.sh
+          scripts/prepare-pyapp-distribution.sh "$wheel" "${{ matrix.python_url }}" pyapp-distribution.tar.gz
+
       - name: Build binary
         shell: bash
         env:
           PYAPP_PROJECT_VERSION: ${{ needs.build-wheel.outputs.version }}
+          PYAPP_DISTRIBUTION_PATH: ${{ github.workspace }}/pyapp-distribution.tar.gz
+          PYAPP_DISTRIBUTION_PYTHON_PATH: ${{ matrix.python_path }}
         run: |
-          wheel="$(realpath "$(ls -1 dist/*.whl | head -1)")"
-          export PYAPP_PROJECT_PATH="$wheel"
           cd "$PYAPP_DIR"
           cargo build --release
           cp "target/release/${{ matrix.source }}" "../${{ matrix.target }}"

@@ -1,6 +1,6 @@
 [project]
 name = "video-puzzle"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop app that tiles videos into a mosaic (puzzle layouts or a video wall) via ffmpeg"
 readme = "README.md"
 license = { file = "LICENSE" }
