@@ -109,7 +109,7 @@ jobs:
       - name: Prepare embedded Python distribution
         shell: bash
         run: |
-          wheel="$(cd dist && pwd)/$(ls -1 *.whl | head -1)"
+          wheel="$(realpath "$(ls -1 dist/*.whl | head -1)")"
           chmod +x scripts/prepare-pyapp-distribution.sh
           scripts/prepare-pyapp-distribution.sh "$wheel" "${{ matrix.python_url }}" pyapp-distribution.tar.gz
 
