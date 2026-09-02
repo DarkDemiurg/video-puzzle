@@ -8,8 +8,10 @@ PYTHON_DIST_URL="${2:?usage: prepare-pyapp-distribution.sh <wheel> <python-dist-
 OUTPUT="${3:-pyapp-distribution.tar.gz}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WHEEL="$(realpath "$WHEEL")"
-OUTPUT="$(realpath "$OUTPUT")"
+WHEEL="$(cd "$(dirname "$WHEEL")" && pwd)/$(basename "$WHEEL")"
+if [[ "$OUTPUT" != /* ]]; then
+  OUTPUT="$(pwd)/$OUTPUT"
+fi
 
 WORKDIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORKDIR"; }
