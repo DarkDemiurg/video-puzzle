@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, Signal
+from PySide6.QtCore import QByteArray, QMimeData, QPointF, QSize, Qt, Signal
 from PySide6.QtGui import QDrag, QDragEnterEvent, QDropEvent, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -12,10 +12,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from video_puzzle.i18n import tr
 from video_puzzle.state import is_video_file
 
-FILE_FILTER = "Видео (*.mp4 *.mov *.mkv *.webm *.avi *.m4v);;Все файлы (*)"
 SLOT_MIME = "application/x-video-puzzle-slot"
+
+
+def video_file_filter() -> str:
+    return tr("Video files (*.mp4 *.mov *.mkv *.webm *.avi *.m4v);;All files (*)")
 
 
 def paths_from_urls(urls: list) -> list[Path]:
@@ -33,8 +37,10 @@ class SlotWidget(QFrame):
         super().__init__(parent)
         self.index = index
         self._pixmap: QPixmap | None = None
+        self._current_path: Path | None = None
+        self._error_message: str | None = None
         self._wall_mode = False
-        self._press_pos = None
+        self._press_pos: QPointF | None = None
         self._dragged = False
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -43,7 +49,7 @@ class SlotWidget(QFrame):
         self.setObjectName("slot")
         self.setProperty("filled", False)
 
-        self.preview = QLabel("Перетащите видео\nили нажмите, чтобы выбрать")
+        self.preview = QLabel(tr("Drop a video here\nor click to choose"))
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setObjectName("slotPreview")
         self.preview.setWordWrap(True)
@@ -63,7 +69,7 @@ class SlotWidget(QFrame):
         self.mark_btn.setFixedHeight(28)
         self.mark_btn.setVisible(False)
         self.mark_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.mark_btn.setToolTip("Разметить фрагмент")
+        self.mark_btn.setToolTip(tr("Mark a fragment"))
         self.mark_btn.clicked.connect(lambda: self.trim_requested.emit(self.index))
 
         self.clear_btn = QPushButton("×")
@@ -71,7 +77,7 @@ class SlotWidget(QFrame):
         self.clear_btn.setFixedSize(28, 28)
         self.clear_btn.setVisible(False)
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_btn.setToolTip("Убрать файл")
+        self.clear_btn.setToolTip(tr("Remove file"))
         self.clear_btn.clicked.connect(lambda: self.cleared.emit(self.index))
 
         caption = QHBoxLayout()
@@ -93,10 +99,17 @@ class SlotWidget(QFrame):
     def minimumSizeHint(self) -> QSize:
         return QSize(180, 110)
 
+    @property
+    def current_path(self) -> Path | None:
+        """The file currently shown in this cell (used to restore hidden cells)."""
+        return self._current_path
+
     def set_empty(self) -> None:
         self._pixmap = None
+        self._current_path = None
+        self._error_message = None
         self.preview.setPixmap(QPixmap())
-        self.preview.setText("Перетащите видео\nили нажмите, чтобы выбрать")
+        self.preview.setText(tr("Drop a video here\nor click to choose"))
         self.filename.setVisible(False)
         self.clear_btn.setVisible(False)
         self.set_fragment_label(None)
@@ -105,16 +118,20 @@ class SlotWidget(QFrame):
 
     def set_loading(self, path: Path) -> None:
         self._pixmap = None
+        self._current_path = path
+        self._error_message = None
         self.preview.setPixmap(QPixmap())
-        self.preview.setText("Извлекаю кадр…")
+        self.preview.setText(tr("Extracting frame…"))
         self.filename.setText(path.name)
         self.filename.setVisible(True)
         self.clear_btn.setVisible(True)
         self._set_filled(True)
         self._refresh_mark_btn()
 
-    def set_thumbnail(self, path: Path, image: Path) -> None:
-        self._pixmap = QPixmap(str(image))
+    def set_thumbnail(self, path: Path, image: QPixmap) -> None:
+        self._pixmap = image
+        self._current_path = path
+        self._error_message = None
         self.filename.setText(path.name)
         self.filename.setVisible(True)
         self.clear_btn.setVisible(True)
@@ -124,13 +141,26 @@ class SlotWidget(QFrame):
 
     def set_error(self, path: Path, message: str) -> None:
         self._pixmap = None
+        self._current_path = path
+        self._error_message = message
         self.preview.setPixmap(QPixmap())
-        self.preview.setText(f"Нет превью\n{message}")
+        self.preview.setText(tr("No preview\n{message}", message=message))
         self.filename.setText(path.name)
         self.filename.setVisible(True)
         self.clear_btn.setVisible(True)
         self._set_filled(True)
         self._refresh_mark_btn()
+
+    def retranslate(self) -> None:
+        """Refresh strings after a language switch without losing the cell state."""
+        self.mark_btn.setToolTip(tr("Mark a fragment"))
+        self.clear_btn.setToolTip(tr("Remove file"))
+        if self._current_path is None:
+            self.preview.setText(tr("Drop a video here\nor click to choose"))
+        elif self._error_message is not None:
+            self.preview.setText(tr("No preview\n{message}", message=self._error_message))
+        elif self._pixmap is None:
+            self.preview.setText(tr("Extracting frame…"))
 
     def set_fragment_label(self, text: str | None) -> None:
         if text:
@@ -216,7 +246,9 @@ class SlotWidget(QFrame):
         self._pick_file()
 
     def _pick_file(self) -> None:
-        chosen, _ = QFileDialog.getOpenFileName(self, "Выберите видеофайл", "", FILE_FILTER)
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, tr("Choose a video file"), "", video_file_filter()
+        )
         if not chosen:
             return
         path = Path(chosen)
@@ -236,7 +268,7 @@ class SlotWidget(QFrame):
 
     def dropEvent(self, event: QDropEvent) -> None:
         if event.mimeData().hasFormat(SLOT_MIME):
-            raw = bytes(event.mimeData().data(SLOT_MIME)).decode("utf-8")
+            raw = bytes(event.mimeData().data(SLOT_MIME).data()).decode("utf-8")
             try:
                 source = int(raw)
             except ValueError:

@@ -64,11 +64,11 @@ def test_apply_shortest_from_start_uses_min_clip_length() -> None:
 
 def test_apply_shortest_from_start_needs_files_and_durations() -> None:
     empty = [Slot(path=Path("a.mp4"), duration=5.0), Slot()]
-    with pytest.raises(AutoFragmentError, match="ячейки"):
+    with pytest.raises(AutoFragmentError, match="every cell"):
         apply_shortest_from_start(empty, 2)
     probing = [
         Slot(path=Path("a.mp4"), duration=5.0),
         Slot(path=Path("b.mp4")),
     ]
-    with pytest.raises(AutoFragmentError, match="длительности"):
+    with pytest.raises(AutoFragmentError, match="duration"):
         apply_shortest_from_start(probing, 2)

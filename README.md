@@ -6,7 +6,7 @@
 **Video Puzzle** — desktop app for tiling several videos into one mosaic and exporting the result with **ffmpeg**.  
 Two modes: classic **puzzle** (2–4 clips) and a **video wall** (grid up to 8×8 with per-cell fragments).
 
-Десктопное приложение на **Python / PySide6**: склейка роликов в мозаику или видеостену, разметка фрагментов, синхронизация по звуку, экспорт в MP4. Интерфейс на русском.
+Десктопное приложение на **Python / PySide6**: склейка роликов в мозаику или видеостену, разметка фрагментов, синхронизация по звуку, экспорт в MP4. Интерфейс следует языку системы (английский и русский), язык можно переключить в боковой панели; переменная `VIDEO_PUZZLE_LANG=ru|en` задаёт его принудительно.
 
 ## Скачать
 
@@ -93,6 +93,10 @@ chmod +x scripts/build-pyapp.sh
 # → dist/pyapp/video-puzzle
 ```
 
+Скрипт проверяет SHA-256 архива PyApp и встроенного Python, а зависимости ставит
+только по хешам из `uv export`. Для не-Linux платформы задайте `PYAPP_PYTHON_DIST_URL`
+и `PYAPP_PYTHON_DIST_SHA256` (для Linux x86_64 хеш уже зашит).
+
 Публикация на GitHub: создайте тег `v0.1.0` и запушьте — workflow [release.yml](.github/workflows/release.yml) соберёт wheel, бинарники для всех платформ и создаст Release.
 
 ```bash
@@ -106,12 +110,15 @@ git push origin v0.1.0
 
 ```bash
 uv sync
-uv run pytest
+uv run pytest -W error
 uv run ruff check src tests
-uv run ruff format src tests
+uv run ruff format --check src tests
+uv run mypy src/video_puzzle
 ```
 
 Точка входа: `src/video_puzzle/`. GUI-тесты идут с `QT_QPA_PLATFORM=offscreen` (см. `tests/conftest.py`).
+
+Строки интерфейса и ошибок в исходниках английские и проходят через `video_puzzle.i18n.tr`/`trn`. Русский каталог лежит в `src/video_puzzle/translations/ru.py`; `tests/test_i18n.py` проверяет, что все строки переведены и плейсхолдеры совпадают.
 
 ## Лицензия
 

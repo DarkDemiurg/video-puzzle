@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from video_puzzle.i18n import tr
 from video_puzzle.state import Slot
 
 LENGTH_WARN_SECONDS = 2.0
@@ -72,13 +73,13 @@ def apply_shortest_from_start(slots: list[Slot], count: int) -> float:
     known: list[float] = []
     for slot in active:
         if slot.path is None:
-            raise AutoFragmentError("Заполните все ячейки сетки.")
+            raise AutoFragmentError(tr("Fill every cell in the grid."))
         if slot.duration is None:
-            raise AutoFragmentError("Дождитесь определения длительности всех роликов.")
+            raise AutoFragmentError(tr("Wait until every clip duration is known."))
         known.append(slot.duration)
     span = min(known)
     if span <= 0.04:
-        raise AutoFragmentError("Самый короткий ролик слишком короткий для фрагмента.")
+        raise AutoFragmentError(tr("The shortest clip is too short for a fragment."))
     for slot in active:
         slot.set_marks(0.0, span)
     return span

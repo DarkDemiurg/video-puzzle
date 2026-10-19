@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from video_puzzle.i18n import tr
+
 
 class EncodeQuality(StrEnum):
     DRAFT = "draft"
@@ -61,12 +63,12 @@ def estimate_output_bytes(
 
 def format_size(nbytes: int) -> str:
     if nbytes < 1024:
-        return f"{nbytes} Б"
+        return tr("{n} B", n=nbytes)
     if nbytes < 1024 * 1024:
-        return f"{nbytes / 1024:.0f} КБ"
+        return tr("{n} KB", n=f"{nbytes / 1024:.0f}")
     if nbytes < 1024 * 1024 * 1024:
-        return f"{nbytes / (1024 * 1024):.0f} МБ"
-    return f"{nbytes / (1024 * 1024 * 1024):.1f} ГБ"
+        return tr("{n} MB", n=f"{nbytes / (1024 * 1024):.0f}")
+    return tr("{n} GB", n=f"{nbytes / (1024 * 1024 * 1024):.1f}")
 
 
 def video_encoder_args(kind: EncoderKind, quality: EncodeQuality) -> list[str]:

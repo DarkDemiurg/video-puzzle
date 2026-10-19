@@ -15,10 +15,10 @@ from video_puzzle.encoders import (
 )
 
 
-def test_format_size_uses_russian_units() -> None:
-    assert format_size(500) == "500 Б"
-    assert format_size(2048) == "2 КБ"
-    assert format_size(2 * 1024 * 1024) == "2 МБ"
+def test_format_size_uses_english_units() -> None:
+    assert format_size(500) == "500 B"
+    assert format_size(2048) == "2 KB"
+    assert format_size(2 * 1024 * 1024) == "2 MB"
 
 
 def test_estimate_grows_with_duration_and_quality() -> None:

@@ -67,12 +67,16 @@ def detect_encoders(*, ffmpeg: str | None = None, runner: Runner = subprocess.ru
     binary = ffmpeg or ffmpeg_binary()
     if binary is None:
         return {"libx264"}
-    result = runner(
-        [binary, "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = runner(
+            [binary, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"libx264"}
     names = parse_encoder_list((result.stdout or "") + (result.stderr or ""))
     names.add("libx264")
     working = {"libx264"}

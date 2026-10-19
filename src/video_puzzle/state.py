@@ -1,7 +1,9 @@
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from video_puzzle.encode import DEFAULT_ENCODER, DEFAULT_QUALITY, EncodeQuality, EncoderKind
+from video_puzzle.i18n import tr
 from video_puzzle.layout import (
     MAX_GRID,
     MAX_SLOTS,
@@ -24,6 +26,8 @@ class Slot:
     duration: float | None = None
     has_audio: bool = False
     fps: float | None = None
+    has_video: bool = True
+    probe_error: str | None = None
     trim_start: float = 0.0
     mark_in: float | None = None
     mark_out: float | None = None
@@ -35,6 +39,8 @@ class Slot:
         self.duration = None
         self.has_audio = False
         self.fps = None
+        self.has_video = True
+        self.probe_error = None
         self.trim_start = 0.0
         self.mark_in = None
         self.mark_out = None
@@ -47,6 +53,8 @@ class Slot:
             self.duration = None
             self.has_audio = False
             self.fps = None
+            self.has_video = True
+            self.probe_error = None
             self.mark_in = None
             self.mark_out = None
             self.rotation = 0
@@ -57,6 +65,32 @@ class Slot:
         duration = self.duration if self.duration is not None else mark_out
         start = min(max(0.0, mark_in), max(0.0, duration - 0.04))
         end = min(max(start + 0.04, mark_out), duration if self.duration is not None else mark_out)
+        self.mark_in = start
+        self.mark_out = end
+
+    def clamp_marks_to_duration(self) -> None:
+        """Drop or trim an I/O range that no longer fits the probed duration.
+
+        A project stores marks without knowing the media duration; after the async
+        probe reports it, marks from a longer cut (say 20–30 s on a 10 s clip) used to
+        stay untouched. The wall then looked export-ready while ffmpeg produced an
+        empty file. Marks starting at or after the end are cleared so the user is
+        asked to mark the fragment again instead of silently getting 0.04 s.
+        """
+        if self.mark_in is None or self.mark_out is None or self.duration is None:
+            return
+        duration = self.duration
+        if not math.isfinite(duration) or duration <= 0.04:
+            self.clear_marks()
+            return
+        if self.mark_in >= duration - 0.04:
+            self.clear_marks()
+            return
+        start = min(max(0.0, self.mark_in), max(0.0, duration - 0.04))
+        end = min(max(start + 0.04, self.mark_out), duration)
+        if end <= start:
+            self.clear_marks()
+            return
         self.mark_in = start
         self.mark_out = end
 
@@ -108,14 +142,19 @@ class AppState:
 
     def __post_init__(self) -> None:
         if len(self.slots) != MAX_SLOTS:
-            raise ValueError(f"Expected {MAX_SLOTS} slots, got {len(self.slots)}")
+            raise ValueError(
+                tr(
+                    "Expected {expected} slots, got {actual}",
+                    expected=MAX_SLOTS,
+                    actual=len(self.slots),
+                )
+            )
         canvas_size(self.resolution)
         self._clamp_wall()
         self.quality = EncodeQuality(self.quality)
         self.encoder = EncoderKind(self.encoder)
         self.cell_gap = even(max(0, min(40, self.cell_gap)))
-        if self.audio_slot is not None and not 0 <= self.audio_slot < MAX_SLOTS:
-            self.audio_slot = None
+        self.prune_audio_slot()
 
     @property
     def is_wall(self) -> bool:
@@ -129,12 +168,14 @@ class AppState:
 
     def set_mode(self, mode: AppMode) -> None:
         self.mode = mode
+        self.prune_audio_slot()
         self.clamp_playhead()
 
     def set_wall_grid(self, rows: int, cols: int) -> None:
         self.wall_rows = rows
         self.wall_cols = cols
         self._clamp_wall()
+        self.prune_audio_slot()
         self.clamp_playhead()
 
     def _clamp_wall(self) -> None:
@@ -143,7 +184,26 @@ class AppState:
 
     def set_layout(self, layout: Layout) -> None:
         self.layout = layout
+        self.prune_audio_slot()
         self.clamp_playhead()
+
+    def set_audio_slot(self, index: int | None) -> None:
+        """Pin the audio source to an active slot, or None for 'first clip with sound'."""
+        if index is not None and not 0 <= index < self.active_count:
+            raise IndexError(tr("Audio slot {slot} is outside the active scheme", slot=index))
+        self.audio_slot = index
+
+    def prune_audio_slot(self) -> None:
+        """Drop a pinned audio source that no longer exists in the active scheme.
+
+        Without this a 4-slot project shrunk to 2 slots keeps ``audio_slot=3``:
+        ``audio_input_index`` refuses the dead index, the script silently becomes
+        ``-an``, and the UI still shows the old choice as if sound were selected.
+        Falling back to None restores the automatic pick, so audio survives the
+        scheme change whenever any active clip has a stream.
+        """
+        if self.audio_slot is not None and not 0 <= self.audio_slot < self.active_count:
+            self.audio_slot = None
 
     def set_resolution(self, height: int) -> None:
         canvas_size(height)
@@ -162,38 +222,82 @@ class AppState:
         if first == second:
             return
         if not 0 <= first < MAX_SLOTS or not 0 <= second < MAX_SLOTS:
-            raise IndexError("Slot index is out of range")
+            raise IndexError(tr("Slot index is out of range"))
         self.slots[first], self.slots[second] = self.slots[second], self.slots[first]
+        # A pinned source belongs to the clip, not to the cell it sat in: following the
+        # swap keeps the picked audio playing after the user rearranges the mosaic.
+        if self.audio_slot == first:
+            self.audio_slot = second
+        elif self.audio_slot == second:
+            self.audio_slot = first
         self.clamp_playhead()
 
     def set_slot(self, index: int, path: Path | None) -> None:
         if not 0 <= index < MAX_SLOTS:
-            raise IndexError(f"Slot index {index} is out of range")
+            raise IndexError(tr("Slot index {slot} is out of range", slot=index))
+        previous = self.slots[index].path
         if path is None:
             self.slots[index].clear()
+            if previous is not None and self.audio_slot == index:
+                self.audio_slot = None
             self.clamp_playhead()
             return
         if not is_video_file(path):
-            raise ValueError(f"Unsupported video type: {path.suffix}")
+            raise ValueError(tr("Unsupported video type: {suffix}", suffix=path.suffix))
         self.slots[index].set_path(path)
+        if previous is not None and previous != path and self.audio_slot == index:
+            # The clip was replaced, so its audio properties are unknown until the next
+            # probe; an explicit pick that may point at a silent file is not honest.
+            # Filling an empty slot keeps the pin — the file simply arrives later.
+            self.audio_slot = None
 
     def clear_slot(self, index: int) -> None:
         self.set_slot(index, None)
 
     def set_probe(
-        self, index: int, duration: float, has_audio: bool, fps: float | None = None
+        self,
+        index: int,
+        duration: float,
+        has_audio: bool,
+        fps: float | None = None,
+        *,
+        has_video: bool = True,
     ) -> None:
         if not 0 <= index < MAX_SLOTS:
-            raise IndexError(f"Slot index {index} is out of range")
-        self.slots[index].duration = max(0.0, duration)
-        self.slots[index].has_audio = has_audio
-        self.slots[index].fps = fps if fps is not None and fps > 0 else None
+            raise IndexError(tr("Slot index {slot} is out of range", slot=index))
+        if not math.isfinite(duration):
+            raise ValueError(tr("Probed duration must be finite"))
+        slot = self.slots[index]
+        slot.duration = max(0.0, duration)
+        slot.has_audio = has_audio
+        slot.fps = fps if fps is not None and math.isfinite(fps) and fps > 0 else None
+        slot.has_video = has_video
+        slot.probe_error = None
+        slot.clamp_marks_to_duration()
+        self.clamp_playhead()
+
+    def set_probe_error(self, index: int, message: str) -> None:
+        if not 0 <= index < MAX_SLOTS:
+            raise IndexError(tr("Slot index {slot} is out of range", slot=index))
+        slot = self.slots[index]
+        slot.duration = None
+        slot.has_audio = False
+        slot.fps = None
+        slot.has_video = False
+        slot.probe_error = message
+        slot.clear_marks()
         self.clamp_playhead()
 
     def assign_paths(self, paths: list[Path], start: int = 0) -> int:
-        """Fill empty active slots starting at `start`. Returns how many were assigned."""
+        """Fill empty active slots going forward from `start`. Returns how many fit.
+
+        The walk never wraps: files dropped on cell 3 used to be placed into cells 0
+        and 1 — slots the user did not drop on and might already hold a chosen clip.
+        Anything that does not fit after the target is reported by the caller instead
+        of being scattered backwards, and cells outside the active scheme stay alone.
+        """
         assigned = 0
-        index = start
+        index = max(0, start)
         for candidate in paths:
             if not is_video_file(candidate):
                 continue
@@ -215,8 +319,37 @@ class AppState:
     def missing_slot_indexes(self) -> list[int]:
         return [i for i, slot in enumerate(self.active_slots()) if slot.path is None]
 
+    def missing_fragment_indexes(self) -> list[int]:
+        """Wall cells that have a file but no I/O range.
+
+        Without a fragment the wall silently encodes each file from its first frame
+        to the shortest *full* file, so a six-hour source would produce a six-hour
+        mosaic; the export must refuse instead of guessing.
+        """
+        if not self.is_wall:
+            return []
+        return [
+            i
+            for i, slot in enumerate(self.active_slots())
+            if slot.path is not None and not slot.has_fragment
+        ]
+
     def is_complete(self) -> bool:
         return not self.missing_slot_indexes()
+
+    def is_ready_for_export(self) -> bool:
+        """Every active clip must be present, probed and have valid media.
+
+        A filled slot is not enough: before the async probe finishes the duration is
+        unknown, and after a failed probe (missing file, audio-only container) ffmpeg
+        would fail deep inside the filter graph. Both cases must block export.
+        """
+        if not self.is_complete():
+            return False
+        for slot in self.active_slots():
+            if slot.duration is None or slot.probe_error is not None or not slot.has_video:
+                return False
+        return not self.missing_fragment_indexes()
 
     def overlap_duration(self) -> float | None:
         """Common timeline length after start trims, or None if a duration is still unknown."""

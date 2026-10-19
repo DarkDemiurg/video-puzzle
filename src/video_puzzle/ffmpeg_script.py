@@ -5,15 +5,18 @@ from pathlib import Path
 
 from video_puzzle.encode import ENCODE_PRESETS, video_encoder_args
 from video_puzzle.encoders import resolve_encoder
+from video_puzzle.i18n import tr
 from video_puzzle.layout import (
     AppMode,
     Layout,
     canvas_size,
     cell_sizes,
     even,
-    grid_cell_size,
-    output_size,
-    pad_size,
+    grid_cell_boxes,
+    grid_output_size,
+    grid_pad_boxes,
+    mosaic_frame_size,
+    mosaic_pad_boxes,
     xstack_layout,
 )
 from video_puzzle.state import AppState, Slot
@@ -23,6 +26,36 @@ DEFAULT_FPS = 30
 
 class IncompleteStateError(ValueError):
     """Raised when a mosaic script is requested before every active slot is filled."""
+
+
+def _require_ready(state: AppState, *, what: str) -> None:
+    """Refuse to build an export for an incomplete scheme.
+
+    A wall whose cells have no I/O marks used to pass this check: ffmpeg then took
+    every file from frame one and ``-shortest`` stretched the mosaic to the length
+    of the longest full clip instead of the intended fragment.
+    """
+    missing_files = state.missing_slot_indexes()
+    if missing_files:
+        empty = ", ".join(str(i + 1) for i in missing_files)
+        raise IncompleteStateError(
+            tr(
+                "Fill all slots before generating {what} (empty: {empty})",
+                what=what,
+                empty=empty,
+            )
+        )
+    missing_fragments = state.missing_fragment_indexes()
+    if missing_fragments:
+        cells = ", ".join(str(i + 1) for i in missing_fragments)
+        raise IncompleteStateError(
+            tr(
+                "Mark a fragment (I/O) in every wall cell before generating {what} "
+                "(unset: {cells})",
+                what=what,
+                cells=cells,
+            )
+        )
 
 
 def _seek_args(start: float, end: float | None) -> list[str]:
@@ -95,31 +128,31 @@ def _audio_filter(index: int, *, normalize: bool) -> str:
     return f"[{index}:a]" + ",".join(chain) + "[outa]"
 
 
-def _stack_filters(layout: Layout) -> list[str]:
+def _stack_filters(layout: Layout, *, final: str = "outv") -> list[str]:
     if layout is Layout.TWO_HORIZONTAL:
-        return ["[v0][v1]hstack=inputs=2[outv]"]
+        return [f"[v0][v1]hstack=inputs=2[{final}]"]
     if layout is Layout.TWO_VERTICAL:
-        return ["[v0][v1]vstack=inputs=2[outv]"]
+        return [f"[v0][v1]vstack=inputs=2[{final}]"]
     if layout in {Layout.THREE_PYRAMID, Layout.THREE_PYRAMID_NARROW}:
         return [
             "[v1][v2]hstack=inputs=2[bottom]",
-            "[v0][bottom]vstack=inputs=2[outv]",
+            f"[v0][bottom]vstack=inputs=2[{final}]",
         ]
     if layout is Layout.FOUR_SQUARE:
         return [
             "[v0][v1]hstack=inputs=2[top]",
             "[v2][v3]hstack=inputs=2[bottom]",
-            "[top][bottom]vstack=inputs=2[outv]",
+            f"[top][bottom]vstack=inputs=2[{final}]",
         ]
     raise ValueError(f"Unknown layout: {layout}")
 
 
-def _wall_stack_filters(rows: int, cols: int) -> list[str]:
+def _wall_stack_filters(rows: int, cols: int, *, final: str = "outv") -> list[str]:
     count = rows * cols
     labels = "".join(f"[v{i}]" for i in range(count))
     if count == 1:
-        return ["[v0]null[outv]"]
-    return [f"{labels}xstack=inputs={count}:layout={xstack_layout(rows, cols)}[outv]"]
+        return [f"[v0]null[{final}]"]
+    return [f"{labels}xstack=inputs={count}:layout={xstack_layout(rows, cols)}[{final}]"]
 
 
 def _gap(state: AppState) -> int:
@@ -129,52 +162,36 @@ def _gap(state: AppState) -> int:
 def _mosaic_cells(state: AppState) -> list[tuple[int, int]]:
     width, height = canvas_size(state.resolution)
     if state.mode is AppMode.WALL:
-        cell = grid_cell_size(state.wall_cols, state.wall_rows, width, height)
-        return [cell] * state.active_count
+        return grid_cell_boxes(state.wall_cols, state.wall_rows, width, height)
     return cell_sizes(state.layout, width, height)
 
 
-def _mosaic_pad(state: AppState, index: int, scale_w: int, scale_h: int) -> tuple[int, int]:
+def _mosaic_pads(state: AppState) -> list[tuple[int, int]]:
+    width, height = canvas_size(state.resolution)
     gap = _gap(state)
     if state.mode is AppMode.WALL:
-        return scale_w + gap, scale_h + gap
-    width, height = canvas_size(state.resolution)
-    pad_w, pad_h = pad_size(state.layout, index, width, height)
-    return pad_w + gap, pad_h + gap
+        return grid_pad_boxes(state.wall_cols, state.wall_rows, width, height, gap)
+    return mosaic_pad_boxes(state.layout, width, height, gap)
 
 
 def mosaic_output_size(state: AppState) -> tuple[int, int]:
     width, height = canvas_size(state.resolution)
     gap = _gap(state)
     if state.mode is AppMode.WALL:
-        cell_w, cell_h = grid_cell_size(state.wall_cols, state.wall_rows, width, height)
-        return (cell_w + gap) * state.wall_cols, (cell_h + gap) * state.wall_rows
-    out_w, out_h = output_size(state.layout, width, height)
-    if gap <= 0:
-        return out_w, out_h
-    layout = state.layout
-    if layout is Layout.TWO_HORIZONTAL:
-        return out_w + 2 * gap, out_h + gap
-    if layout is Layout.TWO_VERTICAL:
-        return out_w + gap, out_h + 2 * gap
-    if layout is Layout.FOUR_SQUARE:
-        return out_w + 2 * gap, out_h + 2 * gap
-    if layout is Layout.THREE_PYRAMID:
-        return out_w + gap, out_h + 2 * gap
-    if layout is Layout.THREE_PYRAMID_NARROW:
-        return out_w + 2 * gap, out_h + 2 * gap
-    return out_w, out_h
+        return grid_output_size(state.wall_cols, state.wall_rows, width, height, gap)
+    return mosaic_frame_size(state.layout, width, height, gap)
 
 
 def build_filter_complex(state: AppState, *, fps: float | None = None) -> str:
     cells = _mosaic_cells(state)
+    pads = _mosaic_pads(state)
     count = state.active_count
-    if len(cells) != count:
+    if len(cells) != count or len(pads) != count:
         raise ValueError("Layout cell count does not match active slot count")
     rate = state.output_fps() if fps is None else fps
     prep = []
     for index, (scale_w, scale_h) in enumerate(cells):
-        pad_w, pad_h = _mosaic_pad(state, index, scale_w, scale_h)
+        pad_w, pad_h = pads[index]
         prep.append(
             _prep_filter(
                 index,
@@ -186,11 +203,17 @@ def build_filter_complex(state: AppState, *, fps: float | None = None) -> str:
                 pad_h=pad_h,
             )
         )
+    gap = _gap(state)
+    stacked = "stacked" if gap else "outv"
     if state.mode is AppMode.WALL:
-        stack = _wall_stack_filters(state.wall_rows, state.wall_cols)
+        stack = _wall_stack_filters(state.wall_rows, state.wall_cols, final=stacked)
     else:
-        stack = _stack_filters(state.layout)
+        stack = _stack_filters(state.layout, final=stacked)
     parts = [*prep, *stack]
+    if gap:
+        # Padding puts a gap on the right/bottom of every cell; drop the trailing strip
+        # so only the gaps *between* cells remain.
+        parts.append(f"[stacked]crop=iw-{gap}:ih-{gap}:0:0[outv]")
     audio_index = state.audio_input_index()
     if audio_index is not None:
         parts.append(_audio_filter(audio_index, normalize=state.normalize_audio))
@@ -205,15 +228,13 @@ def build_ffmpeg_args(
     overwrite: bool = False,
     progress: bool = False,
     available_encoders: set[str] | None = None,
+    ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    if not state.is_complete():
-        missing = ", ".join(str(i + 1) for i in state.missing_slot_indexes())
-        raise IncompleteStateError(f"Fill all slots before generating a script (empty: {missing})")
-
+    _require_ready(state, what=tr("a script"))
     settings = ENCODE_PRESETS[state.quality]
     rate = state.output_fps() if fps is None else fps
     kind = resolve_encoder(state.encoder, available_encoders or {"libx264"})
-    args: list[str] = ["ffmpeg"]
+    args: list[str] = [ffmpeg]
     if overwrite:
         args.append("-y")
     args.append("-hide_banner")
@@ -230,11 +251,9 @@ def build_ffmpeg_args(
     return args
 
 
-def build_still_args(state: AppState, dest: Path) -> list[str]:
-    if not state.is_complete():
-        missing = ", ".join(str(i + 1) for i in state.missing_slot_indexes())
-        raise IncompleteStateError(f"Fill all slots before generating a preview (empty: {missing})")
-    args: list[str] = ["ffmpeg", "-y", "-hide_banner"]
+def build_still_args(state: AppState, dest: Path, *, ffmpeg: str = "ffmpeg") -> list[str]:
+    _require_ready(state, what=tr("a preview"))
+    args: list[str] = [ffmpeg, "-y", "-hide_banner"]
     _append_inputs(args, state)
     args.extend(
         [
@@ -259,7 +278,11 @@ def render_shell_script(
     fps: float | None = None,
     available_encoders: set[str] | None = None,
 ) -> str:
-    args = build_ffmpeg_args(state, output, fps=fps, available_encoders=available_encoders)
+    # -y: a saved script is meant to be re-run after tweaking the project, and an
+    # interactive "File exists. Overwrite?" prompt would hang any non-terminal launch.
+    args = build_ffmpeg_args(
+        state, output, fps=fps, overwrite=True, available_encoders=available_encoders
+    )
     canvas_w, canvas_h = canvas_size(state.resolution)
     out_w, out_h = mosaic_output_size(state)
     audio = state.audio_input_index()
@@ -271,14 +294,24 @@ def render_shell_script(
         range_note = (
             f"# Wall duration = shortest fragment ({state.wall_output_duration() or 0:.2f}s)"
         )
+        # A wall takes its window from the I/O marks; ``trim_start`` is a puzzle-only
+        # offset. Printing it here advertised a "-ss" that the command does not contain.
+        fragments = ", ".join(
+            f"{index + 1}={state.source_window(index)[0]:.2f}s"
+            f"–{(state.source_window(index)[1] or 0.0):.2f}s"
+            for index in range(state.active_count)
+        )
+        offsets_note = f"# Wall fragments: {fragments}"
     else:
         layout_note = f"layout={state.layout}"
         range_note = (
             f"# Output range: {state.resolved_range_start():.2f}s–{_range_end_label(state)}"
         )
-    trims = ", ".join(
-        f"{index + 1}={state.slots[index].trim_start:.2f}s" for index in range(state.active_count)
-    )
+        trims = ", ".join(
+            f"{index + 1}={state.slots[index].trim_start:.2f}s"
+            for index in range(state.active_count)
+        )
+        offsets_note = f"# Start trims: {trims}"
     settings = ENCODE_PRESETS[state.quality]
     kind = resolve_encoder(state.encoder, available_encoders or {"libx264"})
     header = [
@@ -288,7 +321,7 @@ def render_shell_script(
         f"# Duration follows the shortest aligned input (-shortest). {audio_note}.",
         f"# Quality: {state.quality}  encoder={kind}  crf={settings.crf}"
         f"  fps={state.output_fps():.3f}",
-        f"# Start trims: {trims}",
+        offsets_note,
         range_note,
     ]
     return "\n".join([*header, shlex.join(args), ""])

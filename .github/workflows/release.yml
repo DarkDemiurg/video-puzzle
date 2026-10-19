@@ -11,6 +11,7 @@ permissions:
 
 env:
   PYAPP_VERSION: "0.29.0"
+  PYAPP_SHA256: "0533004baf6d1d46ef15abad02e98881ec92291c024182a36b57931c8d66df5f"
   PYAPP_PROJECT_NAME: video-puzzle
   PYAPP_PYTHON_VERSION: "3.12"
   PYAPP_EXEC_MODULE: video_puzzle
@@ -59,6 +60,7 @@ jobs:
             source: pyapp
             archive_ext: tar.gz
             python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+            python_sha256: c74addcd1b033a6e4d60ead3ab47fcc995569027e01d3061c4a934f363c4a0cf
             python_path: python/bin/python3
           - os: ubuntu-24.04-arm
             artifact: video-puzzle-linux-aarch64
@@ -66,6 +68,7 @@ jobs:
             source: pyapp
             archive_ext: tar.gz
             python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+            python_sha256: d2a6c0d4ceea088f635b309a59d5d700a256656423225f96ddfb71d532adb1aa
             python_path: python/bin/python3
           - os: windows-2022
             artifact: video-puzzle-windows-x86_64
@@ -73,6 +76,7 @@ jobs:
             source: pyapp.exe
             archive_ext: zip
             python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-pc-windows-msvc-install_only_stripped.tar.gz
+            python_sha256: 3c8b9b10a933909c98b9916297e2093b24a9c2abaa23df1c2622c2bfe052cb94
             python_path: python/python.exe
           - os: macos-14
             artifact: video-puzzle-macos-aarch64
@@ -80,6 +84,7 @@ jobs:
             source: pyapp
             archive_ext: tar.gz
             python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-apple-darwin-install_only_stripped.tar.gz
+            python_sha256: 84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf
             python_path: python/bin/python3
           - os: macos-15-intel
             artifact: video-puzzle-macos-x86_64
@@ -87,12 +92,17 @@ jobs:
             source: pyapp
             archive_ext: tar.gz
             python_url: https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-apple-darwin-install_only_stripped.tar.gz
+            python_sha256: f76a921e71e9c8954cccd00f176b7083041527b3b4223670d05bbb2f51209d3f
             python_path: python/bin/python3
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
 
       - uses: actions/download-artifact@v4
         with:
@@ -103,11 +113,22 @@ jobs:
         shell: bash
         run: |
           curl -fsSL "https://github.com/ofek/pyapp/releases/download/v${PYAPP_VERSION}/source.tar.gz" -o pyapp-source.tar.gz
+          if command -v sha256sum >/dev/null 2>&1; then
+            printf '%s  %s\n' "$PYAPP_SHA256" pyapp-source.tar.gz | sha256sum -c -
+          else
+            printf '%s  %s\n' "$PYAPP_SHA256" pyapp-source.tar.gz | shasum -a 256 -c -
+          fi
           tar -xzf pyapp-source.tar.gz
           echo "PYAPP_DIR=$(echo pyapp-v* | head -1)" >> "$GITHUB_ENV"
 
+      - name: Export hashed runtime requirements
+        run: uv export --frozen --no-dev --no-emit-project --format requirements-txt -o pyapp-requirements.txt
+
       - name: Prepare embedded Python distribution
         shell: bash
+        env:
+          PYTHON_DIST_SHA256: ${{ matrix.python_sha256 }}
+          PYAPP_REQUIREMENTS: ${{ github.workspace }}/pyapp-requirements.txt
         run: |
           wheel="$(realpath "$(ls -1 dist/*.whl | head -1)")"
           chmod +x scripts/prepare-pyapp-distribution.sh
@@ -121,7 +142,7 @@ jobs:
           PYAPP_DISTRIBUTION_PYTHON_PATH: ${{ matrix.python_path }}
         run: |
           cd "$PYAPP_DIR"
-          cargo build --release
+          cargo build --release --locked
           cp "target/release/${{ matrix.source }}" "../${{ matrix.target }}"
           chmod +x "../${{ matrix.target }}" 2>/dev/null || true
 

@@ -37,22 +37,35 @@ def progress_fraction(current: float, total: float) -> float:
 
 
 def format_timecode(seconds: float) -> str:
-    value = max(0.0, seconds)
-    minutes, sec = divmod(value, 60)
-    hours, minutes = divmod(int(minutes), 60)
+    # Work in whole hundredths: rounding the seconds field at print time let
+    # 59.996 render as "0:60.00" instead of rolling over into the next minute.
+    hundredths = int(round(max(0.0, seconds) * 100))
+    minutes, remainder = divmod(hundredths, 6000)
+    hours, minutes = divmod(minutes, 60)
+    sec, cents = divmod(remainder, 100)
     if hours:
-        return f"{hours}:{minutes:02d}:{sec:05.2f}"
-    return f"{int(minutes)}:{sec:05.2f}"
+        return f"{hours}:{minutes:02d}:{sec:02d}.{cents:02d}"
+    return f"{minutes}:{sec:02d}.{cents:02d}"
 
 
-def render_outcome(*, cancelled: bool, code: int) -> str:
-    """How to treat a finished ffmpeg process: success, cancelled, or failed."""
-    if code == 0:
+def render_outcome(*, cancelled: bool, code: int, output_exists: bool) -> str:
+    """How to treat a finished ffmpeg process: success, cancelled, or failed.
+
+    The exit code alone lies in both directions: ffmpeg may exit 0 without ever
+    writing the file, and a cancel that raced a finished render still leaves a
+    usable video. Only a zero code *plus* a written file is a success.
+    """
+    if code == 0 and output_exists:
         return "success"
     if cancelled:
         return "cancelled"
     return "failed"
 
 
-def should_delete_partial_output(*, cancelled: bool, code: int) -> bool:
-    return cancelled and code != 0
+def should_delete_partial_output(*, outcome: str, preexisting: bool) -> bool:
+    """Whether a run that did not produce a usable video left junk to clean up.
+
+    A file that already existed before the run is the user's own data: ffmpeg was
+    told to overwrite it, so deleting it too would destroy something we never made.
+    """
+    return outcome in {"cancelled", "failed"} and not preexisting

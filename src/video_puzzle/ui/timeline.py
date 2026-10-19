@@ -2,6 +2,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSlider, QStyle, QStyleOptionSlider, QWidget
 
+from video_puzzle.i18n import tr
 from video_puzzle.progress import format_timecode
 
 
@@ -94,5 +95,12 @@ class TimelineBar(QWidget):
         text = f"{format_timecode(seconds)} / {format_timecode(self._duration)}"
         start, end = self._range
         if start is not None and end is not None:
-            text += f"  · выход {format_timecode(start)}–{format_timecode(end)}"
+            text += tr(
+                "  · output {start}–{end}",
+                start=format_timecode(start),
+                end=format_timecode(end),
+            )
         self.label.setText(text)
+
+    def retranslate(self) -> None:
+        self._update_label(self.slider.value() / 100.0)

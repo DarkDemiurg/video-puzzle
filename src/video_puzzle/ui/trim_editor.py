@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
@@ -16,11 +17,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
+from video_puzzle.i18n import tr
 from video_puzzle.progress import format_timecode
 from video_puzzle.state import Slot
 from video_puzzle.thumbnails import ThumbnailError, extract_thumbnail
 from video_puzzle.ui.timeline import TimelineBar
 from video_puzzle.wall import clamp_marks
+
+LOGGER = logging.getLogger(__name__)
 
 
 class _FrameWorker(QThread):
@@ -39,6 +43,9 @@ class _FrameWorker(QThread):
             self.succeeded.emit(str(self._dest))
         except ThumbnailError as exc:
             self.failed.emit(str(exc))
+        except Exception:
+            LOGGER.exception("Unexpected frame preview failure for %s", self._video)
+            self.failed.emit(tr("Could not open the preview frame"))
 
 
 class CropPreview(QLabel):
@@ -140,7 +147,7 @@ class TrimEditor(QDialog):
 
     def __init__(self, slot: Slot, cache: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Разметка фрагмента")
+        self.setWindowTitle(tr("Mark a fragment"))
         self.resize(860, 620)
         assert slot.path is not None
         self._path = slot.path
@@ -172,16 +179,14 @@ class TrimEditor(QDialog):
         self.status.setObjectName("hint")
         self.status.setWordWrap(True)
 
-        keys = QLabel(
-            "I/O · ←/→ кадр · Shift+←/→ 1 с · Home/End · на кадре зажмите мышь, чтобы кропнуть"
-        )
+        keys = QLabel(tr("I/O · ←/→ frame · Shift+←/→ 1 s · Home/End · drag on the frame to crop"))
         keys.setObjectName("hint")
 
         row = QHBoxLayout()
-        self.in_btn = QPushButton("I  Вход")
-        self.out_btn = QPushButton("O  Выход")
-        self.go_in_btn = QPushButton("К входу")
-        self.go_out_btn = QPushButton("К выходу")
+        self.in_btn = QPushButton(tr("I  In"))
+        self.out_btn = QPushButton(tr("O  Out"))
+        self.go_in_btn = QPushButton(tr("Go to in"))
+        self.go_out_btn = QPushButton(tr("Go to out"))
         for button, slot_fn in (
             (self.in_btn, self._mark_in_here),
             (self.out_btn, self._mark_out_here),
@@ -195,10 +200,10 @@ class TrimEditor(QDialog):
         nudge = QHBoxLayout()
         frame = 1 / self._fps
         for label, delta in (
-            ("-1 с", -1.0),
-            ("-1 кадр", -frame),
-            ("+1 кадр", frame),
-            ("+1 с", 1.0),
+            (tr("-1 s"), -1.0),
+            (tr("-1 frame"), -frame),
+            (tr("+1 frame"), frame),
+            (tr("+1 s"), 1.0),
         ):
             button = QPushButton(label)
             button.setObjectName("secondary")
@@ -211,17 +216,17 @@ class TrimEditor(QDialog):
             button.setObjectName("secondary")
             button.clicked.connect(lambda _=False, d=delta: self._rotate(d))
             geo.addWidget(button)
-        reset_crop = QPushButton("Сбросить кроп")
+        reset_crop = QPushButton(tr("Reset crop"))
         reset_crop.setObjectName("secondary")
         reset_crop.clicked.connect(self.preview.clear_crop)
         geo.addWidget(reset_crop)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        cancel = QPushButton("Отмена")
+        cancel = QPushButton(tr("Cancel"))
         cancel.setObjectName("secondary")
         cancel.clicked.connect(self.reject)
-        apply = QPushButton("Применить фрагмент")
+        apply = QPushButton(tr("Apply fragment"))
         apply.setObjectName("primary")
         apply.clicked.connect(self.accept)
         buttons.addWidget(cancel)
@@ -307,14 +312,20 @@ class TrimEditor(QDialog):
 
     def _refresh_status(self) -> None:
         length = max(0.0, self._mark_out - self._mark_in)
-        rot = f"  ·  поворот {self._rotation}°" if self._rotation else ""
-        crop = "  ·  кроп" if self.preview.crop() else ""
+        rotation = tr("  ·  rotation {degrees}°", degrees=self._rotation) if self._rotation else ""
+        crop = tr("  ·  crop") if self.preview.crop() else ""
         self.status.setText(
-            f"{self._path.name}\n"
-            f"Курсор {format_timecode(self._playhead)}  ·  "
-            f"In {format_timecode(self._mark_in)}  ·  "
-            f"Out {format_timecode(self._mark_out)}  ·  "
-            f"Длина {format_timecode(length)}{rot}{crop}"
+            tr(
+                "{name}\nPlayhead {playhead}  ·  In {mark_in}  ·  Out {mark_out}  ·  "
+                "Length {length}{rotation}{crop}",
+                name=self._path.name,
+                playhead=format_timecode(self._playhead),
+                mark_in=format_timecode(self._mark_in),
+                mark_out=format_timecode(self._mark_out),
+                length=format_timecode(length),
+                rotation=rotation,
+                crop=crop,
+            )
         )
         self.timeline.set_range_label(self._mark_in, self._mark_out)
 

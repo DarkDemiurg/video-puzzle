@@ -37,14 +37,32 @@ def test_format_timecode() -> None:
     assert format_timecode(3723.0) == "1:02:03.00"
 
 
+def test_format_timecode_carries_rounded_seconds_into_minutes() -> None:
+    # 59.996 rounds to 60.00 s: it must roll over instead of printing "0:60.00".
+    assert format_timecode(59.996) == "1:00.00"
+    assert format_timecode(119.999) == "2:00.00"
+    assert format_timecode(3599.996) == "1:00:00.00"
+    assert format_timecode(-3.0) == "0:00.00"
+
+
 def test_render_outcome() -> None:
-    assert render_outcome(cancelled=False, code=0) == "success"
-    assert render_outcome(cancelled=True, code=0) == "success"
-    assert render_outcome(cancelled=True, code=9) == "cancelled"
-    assert render_outcome(cancelled=False, code=1) == "failed"
+    assert render_outcome(cancelled=False, code=0, output_exists=True) == "success"
+    assert render_outcome(cancelled=True, code=0, output_exists=True) == "success"
+    assert render_outcome(cancelled=True, code=9, output_exists=False) == "cancelled"
+    assert render_outcome(cancelled=False, code=1, output_exists=False) == "failed"
+
+
+def test_render_outcome_needs_a_written_file() -> None:
+    # ffmpeg can exit 0 without producing anything (bad path, filtered out streams).
+    assert render_outcome(cancelled=False, code=0, output_exists=False) == "failed"
+    # A cancel racing a finished render still leaves a usable video.
+    assert render_outcome(cancelled=True, code=0, output_exists=True) == "success"
 
 
 def test_should_delete_partial_output() -> None:
-    assert should_delete_partial_output(cancelled=True, code=255) is True
-    assert should_delete_partial_output(cancelled=True, code=0) is False
-    assert should_delete_partial_output(cancelled=False, code=1) is False
+    assert should_delete_partial_output(outcome="cancelled", preexisting=False) is True
+    assert should_delete_partial_output(outcome="failed", preexisting=False) is True
+    assert should_delete_partial_output(outcome="success", preexisting=False) is False
+    # A file the user already had must survive, even if this run made a mess of it.
+    assert should_delete_partial_output(outcome="cancelled", preexisting=True) is False
+    assert should_delete_partial_output(outcome="failed", preexisting=True) is False

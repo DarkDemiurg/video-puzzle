@@ -1,6 +1,13 @@
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QBoxLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
-from video_puzzle.layout import Layout, slot_count
+from video_puzzle.layout import Layout, even, slot_count
 from video_puzzle.ui.slot_widget import SlotWidget
 
 
@@ -28,12 +35,19 @@ class PreviewCanvas(QWidget):
         for slot in self.slots:
             slot.set_wall_mode(enabled)
 
-    def apply_layout(self, kind: Layout, gap: int = 10) -> None:
+    def apply_layout(self, kind: Layout, gap: int = 0) -> None:
+        """Lay out the mosaic with the *same* spacing ffmpeg will render.
+
+        ``gap`` is the pixel gap between neighbouring cells, so it maps one to one onto
+        layout spacing. Clamping it to a cosmetic minimum here used to make the preview
+        disagree with the exported frame for every gap below that minimum.
+        """
         count = slot_count(kind)
         self.ensure_slots(count)
         inner = self._replace_inner()
         visible = self.slots[:count]
 
+        layout: QBoxLayout
         if kind is Layout.TWO_HORIZONTAL:
             layout = QHBoxLayout(inner)
             for slot in visible:
@@ -71,18 +85,20 @@ class PreviewCanvas(QWidget):
             layout.addLayout(top, 1)
             layout.addLayout(bottom, 1)
 
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(max(8, gap))
+        # No outer margin: ffmpeg only has gaps *between* cells (the trailing strip is
+        # cropped), so a 12 px border here would make the preview lie.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(max(0, even(gap)))
         for slot in visible:
             slot.show()
 
-    def apply_grid(self, rows: int, cols: int, gap: int = 8) -> None:
+    def apply_grid(self, rows: int, cols: int, gap: int = 0) -> None:
         count = rows * cols
         self.ensure_slots(count)
         inner = self._replace_inner()
         grid = QGridLayout(inner)
-        grid.setContentsMargins(12, 12, 12, 12)
-        grid.setSpacing(max(8, gap))
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(max(0, even(gap)))
         for index in range(count):
             slot = self.slots[index]
             grid.addWidget(slot, index // cols, index % cols)
