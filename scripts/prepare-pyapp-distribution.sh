@@ -13,7 +13,7 @@ if [[ "$OUTPUT" != /* ]]; then
   OUTPUT="$(pwd)/$OUTPUT"
 fi
 
-PYTHON_DIST_SHA256="${PYTHON_DIST_SHA256:?set PYTHON_DIST_SHA256 to the archive's sha256}"
+PYTHON_DIST_SHA256="${PYTHON_DIST_SHA256:?set PYTHON_DIST_SHA256 to the sha256 of the archive}"
 PYAPP_REQUIREMENTS="${PYAPP_REQUIREMENTS:?set PYAPP_REQUIREMENTS to a hashed requirements file}"
 
 verify_sha256() {
